@@ -320,6 +320,22 @@ TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL = [
     for shape in TO_DTYPE_OP_SHAPES_UNALIGNED
 ]
 
+TO_DTYPE_ROUND_TRIP_ALT_LAYOUT_PARAMS_SETS = {
+    f"{case}_{_dtype_name(src)}_to_{_dtype_name(dst)}": (
+        cached_randn(shape, dtype=src),
+        dim_order,
+        src,
+        dst,
+    )
+    for case, shape, dim_order in [
+        ("non_last_stick_dim_2d", (64, 64), [1, 0]),
+        ("non_last_stick_dim_3d", (64, 64, 64), [0, 2, 1]),
+        ("sparse_2d", (4, 64), [0, 1, -1]),
+        ("sparse_3d", (4, 8, 64), [0, 1, 2, -1]),
+    ]
+    for src, dst in [(torch.float16, torch.float32), (torch.float32, torch.float16)]
+}
+
 FP32_EPS = torch.finfo(torch.float32).eps  # 1.1920928955078125e-07
 FP16_EPS = torch.finfo(torch.float16).eps  # 0.0009765625
 
@@ -3936,6 +3952,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": TO_DTYPE_OP_ROUND_TRIP_PARAMS_SETS,
             "expect_fail": TO_DTYPE_OP_ROUND_TRIP_EXPECT_FAIL,
         },
+        (
+            "test_to_dtype_round_trip_alt_layout",
+            "test_to_dtype_round_trip_alt_layout",
+        ): {
+            "param_sets": TO_DTYPE_ROUND_TRIP_ALT_LAYOUT_PARAMS_SETS,
+        },
         ("test_conv2d", "test_conv2d_cpu"): {
             "param_sets": {
                 "1x3x32_ksize3_no_pad": (
@@ -5489,6 +5511,21 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             cpu_compile=False,
             run_eager=False,
         )
+
+    def test_to_dtype_round_trip_alt_layout(self, x_cpu, dim_order, src, dst):
+        from torch.spyre import SpyreTensorLayout
+
+        stl = SpyreTensorLayout(
+            list(x_cpu.size()), list(x_cpu.stride()), src, dim_order
+        )
+        x_spyre = x_cpu.to("spyre", device_layout=stl)
+
+        def fn(t):
+            y = t.to(dst)
+            return (y + y).to(src)
+
+        spyre_result = torch.compile(fn, backend="inductor")(x_spyre).cpu()
+        torch.testing.assert_close(spyre_result, fn(x_cpu), atol=0.1, rtol=0.1)
 
     def test_bool_conversion_from_spyre(self):
         torch.manual_seed(42)
