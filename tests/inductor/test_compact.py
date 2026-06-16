@@ -162,6 +162,100 @@ def test_compact_hand_sparse_no_restickify():
     _assert_has_reinterpret(plans["reinterpret_plan"])
 
 
+# -------- Tests: 3D tensors --------
+#
+# 3D input (batch, rows, cols): stick dim is the last dim (cols).
+# Only sum(dim=-1) produces a sparse layout; sum(dim=0) and sum(dim=1) are dense.
+#
+# Verified layouts for input (4, 48, 128) fp16:
+#   input:                device_size=[48, 2, 4, 64]   stride_map=[128, 64, 6144, 1]
+#   sum(dim=-1,kd=True):  device_size=[48, 1, 1, 4, 64] stride_map=[1, -1, -1, 48, -1]  ← sparse
+#   after compact:        device_size=[48, 1, 4, 64]   stride_map=[1, -1, 48, -1]        ← dense
+
+
+def test_compact_3d_correctness():
+    """3D: sum(dim=-1) → compact → add: result matches expected value."""
+
+    def fn(x):
+        y = torch.sum(x, dim=-1, keepdim=True)
+        y = torch.ops.spyre.compact(y)
+        return y + y
+
+    x = torch.ones(4, 48, 128, dtype=torch.float16)
+    x_spyre = x.to(DEVICE)
+    result = _compile_and_run(fn, [x_spyre], DEVICE).cpu()
+    # sum over 128 ones = 128.0, doubled = 256.0
+    expected = torch.full((4, 48, 1), 256.0, dtype=torch.float16)
+    torch.testing.assert_close(result, expected, atol=0.1, rtol=0.1)
+
+
+def test_compact_3d_no_restickify():
+    """3D: sum(dim=-1) → compact → add: no restickify, one reinterpret entry."""
+
+    def fn(x):
+        y = torch.sum(x, dim=-1, keepdim=True)
+        y = torch.ops.spyre.compact(y)
+        return y + y
+
+    x = torch.ones(4, 48, 128, dtype=torch.float16)
+    x_spyre = x.to(DEVICE)
+    _, plans = _capture_plans(fn, [x_spyre])
+
+    _assert_no_restickify(plans["restickify_plan"])
+    _assert_has_reinterpret(plans["reinterpret_plan"])
+
+
+def test_compact_3d_layouts():
+    """3D: verify sparse→dense device_size and stride_map transformation."""
+
+    captured = {}
+    orig_finalize = _passes.finalize_layouts
+
+    def capturing_finalize(graph):
+        orig_finalize(graph)
+        for name, buf in graph.name_to_buffer.items():
+            try:
+                layout = buf.get_layout()
+                if hasattr(layout, "device_layout"):
+                    captured.setdefault("layouts", {})[name] = layout.device_layout
+            except Exception:
+                pass
+
+    def fn(x):
+        y = torch.sum(x, dim=-1, keepdim=True)
+        y = torch.ops.spyre.compact(y)
+        return y + y
+
+    x = torch.ones(4, 48, 128, dtype=torch.float16)
+    x_spyre = x.to(DEVICE)
+
+    with patch.object(_passes, "finalize_layouts", capturing_finalize):
+        _compile_and_run(fn, [x_spyre], DEVICE)
+
+    layouts = captured["layouts"]
+    # buf0: sum output — sparse, device_rank 5
+    # buf1: compact output — dense, device_rank 4 (one dim stripped)
+    buf0_stl = layouts["buf0"]
+    buf1_stl = layouts["buf1"]
+
+    # Sparse: two inner size-1 dims (tile count + outer-stick) both synthetic
+    assert list(buf0_stl.device_size) == [48, 1, 1, 4, 64], (
+        f"Unexpected sparse device_size: {list(buf0_stl.device_size)}"
+    )
+    assert list(buf0_stl.stride_map) == [1, -1, -1, 48, -1], (
+        f"Unexpected sparse stride_map: {list(buf0_stl.stride_map)}"
+    )
+
+    # Dense: one dim fewer, stick dim is now real (stride_map[-1] != -1 except
+    # stick synthetic marker; verify it's the standard dense (4,48,1) layout)
+    assert list(buf1_stl.device_size) == [48, 1, 4, 64], (
+        f"Unexpected dense device_size: {list(buf1_stl.device_size)}"
+    )
+    assert list(buf1_stl.stride_map) == [1, -1, 48, -1], (
+        f"Unexpected dense stride_map: {list(buf1_stl.stride_map)}"
+    )
+
+
 # -------- Negative test: dense input should not reinterpret --------
 
 
@@ -169,7 +263,7 @@ def test_compact_dense_input_no_reinterpret():
     """compact on a dense-output reduction: no reinterpret needed."""
 
     def fn(x):
-        # sum over dim=1 (non-stick dim) produces dense output
+        # sum over dim=0 (non-stick dim) produces dense output
         y = torch.sum(x, dim=0, keepdim=True)
         y = torch.ops.spyre.compact(y)
         return y + y
