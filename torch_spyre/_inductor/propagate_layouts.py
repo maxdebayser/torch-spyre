@@ -730,6 +730,29 @@ def _topk_layouts(
     return results
 
 
+def _compact_layout(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """Layout for spyre::compact.
+
+    compact converts a sparse layout to dense via a zero-cost in-place
+    reinterpretation of the producer buffer.  The output is always the
+    default dense STL for the output host shape; the input is required to
+    present that same dense STL (which costs 0 when the input is sparse —
+    the REINTERPRET sentinel fires in EdgeCostMap._compute_and_cache_cost).
+    """
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    out_stl = SpyreTensorLayout(
+        c_size, c_stride, output.dtype, list(range(len(output.size)))
+    )
+    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [out_stl], op)
+    return [out_stl]
+
+
 def compute_layouts(
     op: Operation,
     output: FixedLayout,
@@ -788,6 +811,9 @@ def compute_layouts(
                 f"views not supported for spyre.layernormnorm({in_layout.size})=>{output.size})"
             )
         return _layernormnorm_layout(op, output, output_dep, args)
+
+    if aten_op == spyreop.compact.default:
+        return _compact_layout(op, output, output_dep, args)
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of

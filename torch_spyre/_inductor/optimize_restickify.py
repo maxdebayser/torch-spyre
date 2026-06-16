@@ -39,7 +39,6 @@ from .pass_utils import (
     compute_restickify_needed,
     device_coordinates,
     host_coordinates,
-    is_sparse_stl,
 )
 
 INF = math.inf
@@ -115,12 +114,11 @@ class EdgeCostMap:
         """
         # Sparse-to-dense: zero-cost reinterpret if the input is sparse and the
         # dense STL for the same host layout matches target_stl.
-        if is_sparse_stl(in_stl):
-            dense_stl = compute_compact_dense_stl(in_stl, self._dep_layout)
-            if dense_stl is not None and dense_stl == target_stl:
-                self._cost[in_stl][target_stl] = 0.0
-                self._layout[in_stl][target_stl] = REINTERPRET
-                return
+        dense_stl = compute_compact_dense_stl(in_stl, self._dep_layout)
+        if dense_stl is not None and dense_stl == target_stl:
+            self._cost[in_stl][target_stl] = 0.0
+            self._layout[in_stl][target_stl] = REINTERPRET
+            return
 
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op

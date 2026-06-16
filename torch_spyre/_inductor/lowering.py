@@ -817,6 +817,38 @@ def lower_restickify(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.compact)
+def lower_compact(x):
+    # compact is a zero-cost layout reinterpret at the compiler level.
+    # It lowers to a Pointwise clone so it materializes a fresh dense buffer.
+    # The layout propagation pass (_compact_layout in propagate_layouts.py)
+    # detects the spyre.compact origin and declares the input must present
+    # a dense STL via FixedInOutNode; EdgeCostMap then fires the REINTERPRET
+    # sentinel on the sparse producer instead of inserting a restickify kernel.
+    base = x
+    while not isinstance(base, StorageBox):
+        base = base.data
+
+    base.realize()
+
+    loader = base.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=base.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    return pw
+
+
 @register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
 def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"

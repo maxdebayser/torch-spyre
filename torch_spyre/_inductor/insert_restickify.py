@@ -85,8 +85,7 @@ def _apply_reinterpret_on_producer(
     """Rewrite the producer buffer's FixedTiledLayout in place to dense_layout.
 
     Preconditions (checked defensively):
-    - The buffer must currently be sparse (stride_map[-1] == -1).
-    - dense_layout must not be sparse.
+    - The buffer's current STL must differ from dense_layout (already dense → skip).
     No FX node is inserted; no OpSpec is created. The consumer kernel will read
     the same bytes under the new dense STL because TensorArg is snapshotted at
     codegen time from the buffer's current layout.
@@ -105,11 +104,8 @@ def _apply_reinterpret_on_producer(
         )
         return
     current_stl = current_layout.device_layout
-    if int(current_stl.stride_map[-1]) != -1:
-        logger.warning(
-            f"reinterpret: buffer {dep_name!r} is not sparse "
-            f"(stride_map[-1]={current_stl.stride_map[-1]}), skipping"
-        )
+    if current_stl == dense_layout.device_layout:
+        logger.warning(f"reinterpret: buffer {dep_name!r} is already dense, skipping")
         return
     logger.info(
         f"Reinterpreting {dep_name!r} in place: "

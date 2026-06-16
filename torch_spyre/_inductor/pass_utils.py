@@ -731,23 +731,29 @@ def compute_compact_dense_stl(
     the default-layout SpyreTensorLayout constructor (no -1 in dim_order),
     preserving element_arrangement from the sparse STL.
 
-    Returns None if sparse_stl is not sparse.
+    Returns None if sparse_stl is already the default dense layout for this
+    host shape (including degenerate cases where host dims of size 1 produce
+    STLs that are indistinguishable from sparse STLs by stride_map alone).
     """
-    if not is_sparse_stl(sparse_stl):
-        return None
     host_size = [concretize_expr(s) for s in host_layout.size]
     dense_stl = SpyreTensorLayout(host_size, host_layout.dtype)
-    return dense_stl.with_element_arrangement(sparse_stl.element_arrangement)
+    dense_stl = dense_stl.with_element_arrangement(sparse_stl.element_arrangement)
+    if sparse_stl == dense_stl:
+        return None
+    return dense_stl
 
 
 def is_sparse_stl(stl: SpyreTensorLayout) -> bool:
-    """Return True if stl is a sparse Spyre layout (one live element per stick).
+    """Return True if stl has the stride_map pattern of a sparse Spyre layout.
 
-    A sparse layout is produced by a reduction along the stick dimension
-    (dim_order ends in -1 at construction time). The outer-stick device dim
-    has device_size == 1 and the stick dim (device_size[-1] == elems_per_stick)
-    is synthetic with stride_map[-1] == -1 (no corresponding host stride).
-    The canonical runtime marker is stride_map[-1] == -1.
+    A sparse layout is produced by a reduction along the stick dimension:
+    the stick dim (device_size[-1] == elems_per_stick) is synthetic with
+    stride_map[-1] == -1 (no corresponding host stride).
+
+    Note: this predicate may return True for dense layouts whose host has all
+    size-1 dims (since size-1 dims also carry stride_map == -1).  Callers that
+    need to distinguish the two cases should use compute_compact_dense_stl
+    with the host FixedLayout, which returns None for already-dense layouts.
     """
     return int(stl.stride_map[-1]) == -1
 
