@@ -34,9 +34,33 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
-from .pass_utils import compute_restickify_needed, device_coordinates, host_coordinates
+from .pass_utils import (
+    compute_compact_dense_stl,
+    compute_restickify_needed,
+    device_coordinates,
+    host_coordinates,
+    is_sparse_stl,
+)
 
 INF = math.inf
+
+
+class _ReinterpretSentinel:
+    """Singleton sentinel stored in EdgeCostMap._layout to signal a zero-cost
+    sparse-to-dense layout reinterpret (no restickify kernel needed)."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return "REINTERPRET"
+
+
+REINTERPRET = _ReinterpretSentinel()
 
 logger = get_inductor_logger("optimize_restickify")
 
@@ -80,8 +104,24 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
+        Cost is 0 if stick-compatible or a zero-cost reinterpret is possible,
+        the input element count if restickifiable, or INF if infeasible.
+
+        When in_stl is sparse and target_stl is the corresponding dense layout
+        (same host shape, same physical bytes), the transition is recorded as
+        REINTERPRET — zero cost, no kernel. finalize_layouts/insert_restickify
+        will rewrite the producer buffer's FixedTiledLayout in place instead of
+        inserting a restickify node.
         """
+        # Sparse-to-dense: zero-cost reinterpret if the input is sparse and the
+        # dense STL for the same host layout matches target_stl.
+        if is_sparse_stl(in_stl):
+            dense_stl = compute_compact_dense_stl(in_stl, self._dep_layout)
+            if dense_stl is not None and dense_stl == target_stl:
+                self._cost[in_stl][target_stl] = 0.0
+                self._layout[in_stl][target_stl] = REINTERPRET
+                return
+
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )

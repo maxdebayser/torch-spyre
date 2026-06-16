@@ -20,7 +20,8 @@ import torch
 from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .pass_utils import copy_fx_custom_meta
+from .optimize_restickify import _ReinterpretSentinel
+from .pass_utils import compute_compact_dense_stl, copy_fx_custom_meta
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -61,6 +62,60 @@ def _record_restickify(
     restickify_plan[op.get_name()].append(
         {"arg_name": dep_name, "target_layout": target_layout}
     )
+
+
+def _record_reinterpret(
+    dep_name: str,
+    dense_layout: FixedTiledLayout,
+    reinterpret_plan: dict,
+) -> None:
+    """Record that the producer buffer dep_name should be reinterpreted in place
+    to dense_layout (no kernel, no FX node).
+
+    reinterpret_plan maps buffer name -> target FixedTiledLayout.
+    """
+    reinterpret_plan[dep_name] = dense_layout
+
+
+def _apply_reinterpret_on_producer(
+    dep_name: str,
+    dense_layout: FixedTiledLayout,
+    graph: GraphLowering,
+) -> None:
+    """Rewrite the producer buffer's FixedTiledLayout in place to dense_layout.
+
+    Preconditions (checked defensively):
+    - The buffer must currently be sparse (stride_map[-1] == -1).
+    - dense_layout must not be sparse.
+    No FX node is inserted; no OpSpec is created. The consumer kernel will read
+    the same bytes under the new dense STL because TensorArg is snapshotted at
+    codegen time from the buffer's current layout.
+    """
+    input_buf = graph.get_buffer(dep_name)
+    if input_buf is None:
+        logger.warning(f"reinterpret: buffer {dep_name!r} not found, skipping")
+        return
+    current_layout = input_buf.get_layout()
+    if isinstance(current_layout, MutationLayoutSHOULDREMOVE):
+        current_layout = current_layout.real_layout()
+    if not isinstance(current_layout, FixedTiledLayout):
+        logger.warning(
+            f"reinterpret: buffer {dep_name!r} layout is {type(current_layout).__name__}, "
+            "expected FixedTiledLayout — skipping"
+        )
+        return
+    current_stl = current_layout.device_layout
+    if int(current_stl.stride_map[-1]) != -1:
+        logger.warning(
+            f"reinterpret: buffer {dep_name!r} is not sparse "
+            f"(stride_map[-1]={current_stl.stride_map[-1]}), skipping"
+        )
+        return
+    logger.info(
+        f"Reinterpreting {dep_name!r} in place: "
+        f"sparse {list(current_stl.device_size)} -> dense {list(dense_layout.device_layout.device_size)}"
+    )
+    input_buf.layout = dense_layout
 
 
 class NameSwapHandler(WrapperHandler):
@@ -199,12 +254,21 @@ def insert_restickify_on_node_inputs(
 
 
 def insert_restickify(graph: GraphLowering) -> None:
-    """Insert restickify operations before all nodes in restickify_plan.
+    """Apply reinterprets and insert restickify operations from finalize_layouts plans.
 
-    Consumes graph.restickify_plan (built by finalize_layouts) and splices the
-    necessary ComputedBuffer nodes into the operations list in-place.
+    Reinterprets (graph.reinterpret_plan): rewrite producer buffer layouts in place,
+    zero-cost, no FX node, no kernel.
+
+    Restickifies (graph.restickify_plan): splice ComputedBuffer nodes into the
+    operations list before their consumers.
     No scheduler state is touched.
     """
+    # Apply reinterprets first — these must happen before restickify insertion
+    # so that subsequent consumers see the updated layout.
+    reinterpret_plan = getattr(graph, "reinterpret_plan", {})
+    for dep_name, dense_layout in reinterpret_plan.items():
+        _apply_reinterpret_on_producer(dep_name, dense_layout, graph)
+
     operations = graph.operations
     restickify_plan = graph.restickify_plan
     if not restickify_plan:
@@ -248,6 +312,7 @@ def finalize_layouts(graph: GraphLowering) -> None:
             del tensor_box.layouts
 
     plan: dict = defaultdict(list)
+    reinterpret_plan: dict = {}
 
     for op in operations:
         cost_fn = getattr(op, "restick_cost_fn", None)
@@ -264,8 +329,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
             stl = committed if cost_fn else op_layouts[0]
             op.layout = _fixed_tiled(op.layout, stl)
 
-        # For each input edge, schedule a restickify if the input's committed STL
-        # is incompatible with what this op requires on that edge.
+        # For each input edge, schedule a restickify or reinterpret if the input's
+        # committed STL is incompatible with what this op requires on that edge.
         if not cost_fn:
             continue
         for edge, target_stl in cost_fn.required_input_stls(committed):
@@ -277,17 +342,35 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 )
                 in_layout = in_layout.real_layout()
             in_stl = in_layout.device_layout
-            restick_stl = edge.layout(in_stl, target_stl)
-            if restick_stl is None:
+            result = edge.layout(in_stl, target_stl)
+            if result is None:
                 continue
-            restick_target = _fixed_tiled(in_layout, restick_stl)
-            logger.info(
-                f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
-                f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
-            )
-            _record_restickify(op, edge.dep.name, restick_target, plan)
+            if isinstance(result, _ReinterpretSentinel):
+                dense_stl = compute_compact_dense_stl(in_stl, in_layout)
+                if dense_stl is None:
+                    # Fallback: shouldn't happen since REINTERPRET implies sparse,
+                    # but guard defensively and fall through to restickify path.
+                    logger.warning(
+                        f"REINTERPRET sentinel on {edge.dep.name} but "
+                        "compute_compact_dense_stl returned None; falling back to restickify"
+                    )
+                    continue
+                dense_target = _fixed_tiled(in_layout, dense_stl)
+                logger.info(
+                    f"Scheduling reinterpret on {edge.dep.name}: "
+                    f"sparse {list(in_stl.device_size)} -> dense {list(dense_stl.device_size)}"
+                )
+                _record_reinterpret(edge.dep.name, dense_target, reinterpret_plan)
+            else:
+                restick_target = _fixed_tiled(in_layout, result)
+                logger.info(
+                    f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
+                    f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
+                )
+                _record_restickify(op, edge.dep.name, restick_target, plan)
 
     V.graph.restickify_plan = plan
+    V.graph.reinterpret_plan = reinterpret_plan
     if logger.isEnabledFor(logging.DEBUG):
         if plan:
             lines = ["restickify plan:"]

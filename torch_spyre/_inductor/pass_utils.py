@@ -721,6 +721,37 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
 
+def compute_compact_dense_stl(
+    sparse_stl: SpyreTensorLayout, host_layout: FixedLayout
+) -> "SpyreTensorLayout | None":
+    """Compute the dense STL for the same buffer described by a sparse STL.
+
+    The sparse STL and dense STL describe the same physical bytes — only the
+    device layout metadata changes. The dense STL is computed from scratch using
+    the default-layout SpyreTensorLayout constructor (no -1 in dim_order),
+    preserving element_arrangement from the sparse STL.
+
+    Returns None if sparse_stl is not sparse.
+    """
+    if not is_sparse_stl(sparse_stl):
+        return None
+    host_size = [concretize_expr(s) for s in host_layout.size]
+    dense_stl = SpyreTensorLayout(host_size, host_layout.dtype)
+    return dense_stl.with_element_arrangement(sparse_stl.element_arrangement)
+
+
+def is_sparse_stl(stl: SpyreTensorLayout) -> bool:
+    """Return True if stl is a sparse Spyre layout (one live element per stick).
+
+    A sparse layout is produced by a reduction along the stick dimension
+    (dim_order ends in -1 at construction time). The outer-stick device dim
+    has device_size == 1 and the stick dim (device_size[-1] == elems_per_stick)
+    is synthetic with stride_map[-1] == -1 (no corresponding host stride).
+    The canonical runtime marker is stride_map[-1] == -1.
+    """
+    return int(stl.stride_map[-1]) == -1
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
