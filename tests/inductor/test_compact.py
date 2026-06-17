@@ -96,28 +96,31 @@ def test_compact_reduction_sparse_no_restickify():
     _assert_has_reinterpret(plans["reinterpret_plan"])
 
 
-@pytest.mark.xfail(
-    reason=(
-        "1D sparse→dense reinterpret: DXP backend crashes with "
-        "'Could not find any suitable dimension mapping' for 1D tiled layouts "
-        "(device_size=[3, 64] from a 192-element 1D tensor). "
-        "Compact on 1D sparse tensors is not yet supported."
-    ),
-    strict=True,
+# M=64 (M equals stick size for fp16) hits the same _reinterpret_coords
+# ambiguity that other reinterpret tests skip — see "Known limitations" in
+# DESIGN.md.  Sizes here all avoid that case.
+@pytest.mark.parametrize(
+    "M,K",
+    [
+        (128, 128),
+        (192, 128),
+        (256, 128),
+        (192, 64),
+        (192, 256),
+    ],
 )
-def test_compact_reduction_sparse_no_keepdim():
-    """sum (no keepdim) → compact → add: result matches expected value."""
+def test_compact_reduction_sparse_no_keepdim(M, K):
+    """sum (no keepdim) → compact → add: 2D input, sparse 1D intermediate, dense 1D output."""
 
     def fn(x):
         y = torch.sum(x, dim=-1, keepdim=False)
         y = torch.ops.spyre.compact(y)
         return y + y
 
-    x = torch.ones(192, 128, dtype=torch.float16)
+    x = torch.ones(M, K, dtype=torch.float16)
     x_spyre = x.to(DEVICE)
     result = _compile_and_run(fn, [x_spyre], DEVICE).cpu()
-    # sum over 128 ones = 128.0, doubled = 256.0
-    expected = torch.full((192,), 256.0, dtype=torch.float16)
+    expected = torch.full((M,), 2.0 * K, dtype=torch.float16)
     torch.testing.assert_close(result, expected, atol=0.1, rtol=0.1)
 
 
