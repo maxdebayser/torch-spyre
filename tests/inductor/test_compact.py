@@ -25,6 +25,7 @@ import torch
 
 import torch_spyre._inductor.passes as _passes
 from torch._inductor.virtualized import V
+from torch_spyre._C import SpyreTensorLayout
 from utils_inductor import _compile_and_run
 
 DEVICE = torch.device("spyre")
@@ -124,10 +125,9 @@ def test_compact_reduction_sparse_no_keepdim(M, K):
 
 
 # -------- Tests: hand-constructed sparse input (produced inside fn) --------
-# Note: compact on a sparse graph *input* (sparse tensor passed as argument)
-# is out of scope for now — rewriting a graph input layout in place is not
-# supported because the DCI at the host↔device boundary is fixed at graph
-# input time. The tests below use sparse tensors produced *inside* fn.
+# Sparse tensors can also enter a compiled graph as inputs (via an explicit
+# device_layout=...). Tests for that path live further below; the tests here
+# cover sparse intermediates produced inside fn.
 
 
 def test_compact_hand_sparse_correctness():
@@ -455,3 +455,101 @@ def test_reinterpret_4d_shapes(B, D, M, K):
     elems = 64
     assert list(result.shape) == [B, D, M, elems], f"Unexpected shape: {result.shape}"
     assert (result == float(K)).all(), f"Expected all {float(K)}, got {result.unique()}"
+
+
+# -------- Tests: sparse graph-input feeding compact --------
+#
+# A sparse tensor can be passed in as a graph input by constructing it on the
+# host with an explicit device_layout=SpyreTensorLayout(..., dim_order). The
+# input shape (N, 1) (trailing size-1 dim) takes the keepdim=True branch of
+# compact_decomp, which delegates to spyre::compact_relabel — that's the path
+# where REINTERPRET-(1) fires for canonical sparse inputs. Two subcases:
+#   - default dim_order [0, 1, ..., rank-1, -1]: the canonical sparse layout
+#     produced by reductions; REINTERPRET-(1) fires (free relabel) and the
+#     TensorBox unwrap in _apply_reinterpret_on_producer is exercised.
+#   - non-default dim_order: REINTERPRET-(1) precondition fails (correctly,
+#     since relabeling across dim_orders would reorder host elements);
+#     restickify is inserted to materialize the canonical sparse layout
+#     before compact_relabel runs.
+
+
+def _sparse_graph_input(
+    host_tensor: torch.Tensor, dim_order: list[int]
+) -> torch.Tensor:
+    # Warm the spyre runtime so torch.Tensor.to is monkey-patched to accept
+    # device_layout=. The patch is installed lazily on first contact with the
+    # spyre device.
+    torch.empty(1, dtype=torch.float16).to(DEVICE)
+    stl = SpyreTensorLayout(
+        host_tensor.size(), host_tensor.stride(), host_tensor.dtype, dim_order
+    )
+    return host_tensor.to(DEVICE, device_layout=stl)
+
+
+def test_compact_sparse_graph_input_canonical_correctness():
+    """Sparse graph input (trailing 1) with default dim_order → compact: free reinterpret path."""
+
+    def fn(t):
+        y = torch.ops.spyre.compact(t)
+        return y + y
+
+    x = torch.arange(192, dtype=torch.float16).reshape(192, 1)
+    x_sparse = _sparse_graph_input(x, [0, 1, -1])
+    result = _compile_and_run(fn, [x_sparse], DEVICE).cpu()
+    torch.testing.assert_close(result, 2.0 * x, rtol=0, atol=0)
+
+
+def test_compact_sparse_graph_input_canonical_no_restickify():
+    """Sparse graph input with default dim_order → compact: reinterpret entry, no restickify.
+
+    Exercises the TensorBox unwrap in _apply_reinterpret_on_producer — without
+    that fix, this path crashes when the optimizer tries to set .layout on a
+    TensorBox-wrapped graph input.
+    """
+
+    def fn(t):
+        y = torch.ops.spyre.compact(t)
+        return y + y
+
+    x = torch.arange(192, dtype=torch.float16).reshape(192, 1)
+    x_sparse = _sparse_graph_input(x, [0, 1, -1])
+    _, plans = _capture_plans(fn, [x_sparse])
+
+    _assert_no_restickify(plans["restickify_plan"])
+    _assert_has_reinterpret(plans["reinterpret_plan"])
+
+
+def test_compact_sparse_graph_input_non_canonical_correctness():
+    """Sparse graph input (trailing 1) with non-default dim_order → compact: restickify path."""
+
+    def fn(t):
+        y = torch.ops.spyre.compact(t)
+        return y + y
+
+    x = torch.arange(192, dtype=torch.float16).reshape(192, 1)
+    x_sparse = _sparse_graph_input(x, [1, 0, -1])
+    result = _compile_and_run(fn, [x_sparse], DEVICE).cpu()
+    torch.testing.assert_close(result, 2.0 * x, rtol=0, atol=0)
+
+
+def test_compact_sparse_graph_input_non_canonical_skips_reinterpret():
+    """Sparse graph input with non-default dim_order → compact: REINTERPRET-(1) skipped.
+
+    REINTERPRET-(1) requires default dim_order on the producer; with a
+    non-canonical sparse input, the precondition must fail. The optimizer
+    falls back to whatever path the consumer needs (restickify or a
+    layout-aware lowering); the key invariant is that the unsound free
+    relabel does NOT fire.
+    """
+
+    def fn(t):
+        y = torch.ops.spyre.compact(t)
+        return y + y
+
+    x = torch.arange(192, dtype=torch.float16).reshape(192, 1)
+    x_sparse = _sparse_graph_input(x, [1, 0, -1])
+    _, plans = _capture_plans(fn, [x_sparse])
+
+    assert not plans["reinterpret_plan"], (
+        f"Expected no reinterpret for non-canonical sparse input, got: {plans['reinterpret_plan']}"
+    )
