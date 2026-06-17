@@ -84,10 +84,10 @@ def _apply_reinterpret_on_producer(
 ) -> None:
     """Rewrite the producer buffer's FixedTiledLayout in place to rewrite_layout.
 
-    Used by both REINTERPRET flavours (see EdgeCostMap):
-    - sparse → dense (spyre::compact)
-    - sparse → sparse with a different synthetic-stick PyTorch dim
-      (spyre::reinterpret).
+    Used by the sparse → dense REINTERPRET flavour in EdgeCostMap (spyre::compact
+    and the in-graph reinterpret seam: a default-dim_order sparse producer is
+    relabeled as the matching default dense STL because their bytes are
+    byte-identical after stripping stick padding).
 
     Preconditions (checked defensively):
     - The buffer's current STL must differ from rewrite_layout (no-op rewrite).
@@ -99,6 +99,15 @@ def _apply_reinterpret_on_producer(
     if input_buf is None:
         logger.warning(f"reinterpret: buffer {dep_name!r} not found, skipping")
         return
+    # Graph inputs are wrapped as TensorBox(StorageBox(InputBuffer)); TensorBox
+    # has no `layout` setter, so unwrap to the underlying InputBuffer (mirrors
+    # the unwrap in finalize_layouts above).
+    if (
+        isinstance(input_buf, TensorBox)
+        and isinstance(input_buf.data, StorageBox)
+        and isinstance(input_buf.data.data, InputBuffer)
+    ):
+        input_buf = input_buf.data.data
     current_layout = input_buf.get_layout()
     if isinstance(current_layout, MutationLayoutSHOULDREMOVE):
         current_layout = current_layout.real_layout()
@@ -351,15 +360,11 @@ def finalize_layouts(graph: GraphLowering) -> None:
             if result is None:
                 continue
             if isinstance(result, _ReinterpretSentinel):
-                # REINTERPRET fires for two cases (see EdgeCostMap._compute_and_cache_cost):
-                #   (a) sparse → dense, same host shape (spyre::compact).
-                #   (b) sparse → sparse with a different synthetic-stick PyTorch
-                #       dim, same host shape (spyre::reinterpret accepting any
-                #       upstream sparse layout).
-                # In both cases the producer's bytes are identical to what the
-                # consumer wants — the rewrite target is exactly target_stl, no
-                # recomputation needed.  We just rewrite the producer's
-                # FixedTiledLayout in place.
+                # REINTERPRET fires for sparse → dense same host shape
+                # (spyre::compact).  The producer's default-dim_order sparse
+                # bytes are identical to the matching dense STL — the rewrite
+                # target is exactly target_stl, no recomputation needed.  We
+                # just rewrite the producer's FixedTiledLayout in place.
                 rewrite_target = _fixed_tiled(in_layout, target_stl)
                 logger.info(
                     f"Scheduling reinterpret on {edge.dep.name}: "

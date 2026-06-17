@@ -758,6 +758,33 @@ def is_sparse_stl(stl: SpyreTensorLayout) -> bool:
     return int(stl.stride_map[-1]) == -1
 
 
+def is_default_dim_order_sparse_stl(
+    stl: SpyreTensorLayout, host_layout: FixedLayout
+) -> bool:
+    """Return True if stl is the sparse STL with default dim_order for host_layout.
+
+    Default dim_order is [0, 1, ..., rank-1, -1] — the dim_order that the C++
+    SpyreTensorLayout default ctor and reduction ops produce.  Producers with
+    this dim_order walk host elements in the same sequence as the default
+    dense STL, which makes a sparse-to-dense REINTERPRET safe.
+
+    A non-default-dim-order producer (only possible today via an explicit
+    user-supplied device_layout= on a graph input) walks host elements in a
+    different sequence; relabeling its bytes as dense would silently miscompile.
+    """
+    host_size = [concretize_expr(s) for s in host_layout.size]
+    host_stride = [concretize_expr(s) for s in host_layout.stride]
+    rank = len(host_size)
+    dim_order = list(range(rank)) + [-1]
+    canonical_sparse = SpyreTensorLayout(
+        host_size, host_stride, host_layout.dtype, dim_order
+    )
+    canonical_sparse = canonical_sparse.with_element_arrangement(
+        stl.element_arrangement
+    )
+    return stl == canonical_sparse
+
+
 def compute_restickify_needed(
     in_stl: SpyreTensorLayout,
     in_host: FixedLayout,
