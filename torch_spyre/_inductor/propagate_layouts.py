@@ -56,7 +56,6 @@ from .constants import (
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
-from .lowering import SPYRE_COMPACT_KEEPDIM_TRUE_ATTR, SPYRE_REINTERPRET_ATTR
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
@@ -744,24 +743,25 @@ def _reinterpret_layout(
     Pointwise buffer.  The output has host shape (*S, elems_per_stick) and
     needs a standard dense layout for that shape.
 
-    The synthetic 64 axis is appended at the end, so the input's sparse stick
-    must correspond to the last PyTorch dim.  We require the canonical sparse
-    STL (dim_order = list(range(rank)) + [-1]); EdgeCostMap will insert a
-    restickify if the producer's sparse stick is elsewhere.  Without this
-    constraint, the lowering's assumption that slot 0 of the trailing 64 axis
-    holds the valid value is only true when the producer happens to put its
-    stick on the last PyTorch dim — and downstream code (e.g. lower_compact's
-    keepdim=False chain) silently miscompiles otherwise.
+    The synthetic 64 axis is appended at the end, so the input's sparse
+    stick must correspond to the last PyTorch dim.  We require the
+    canonical sparse STL (dim_order = list(range(rank)) + [-1]); EdgeCostMap
+    will insert a restickify if the producer's sparse stick is elsewhere.
+    Without this constraint, the lowering's assumption that slot 0 of the
+    trailing 64 axis holds the valid value is only true when the producer
+    happens to put its stick on the last PyTorch dim — and the
+    keepdim=False chain in compact_decomp would silently miscompile
+    otherwise.
 
     The input's sparse STL is read by the OpSpec replacement in spyre_kernel.py
     (not here); this function only assigns layouts.
 
     Reinterpret on dense input is rejected here.  The op's contract is
     sparse → dense; on dense input the broadcast loader and identity OpSpec
-    produce silently-incorrect bytes (each output stick gets 64 copies of one
-    input element instead of the original 64 distinct values).  This also
-    rejects compact-on-dense, since lower_compact's keepdim=False chain calls
-    _lower_reinterpret_impl as its first step.
+    produce silently-incorrect bytes (each output stick gets 64 copies of
+    one input element instead of the original 64 distinct values).  This
+    also rejects compact-on-dense, since the compact decomposition's
+    keepdim=False chain emits spyre::reinterpret as its first step.
     """
     x = args[0]
     if x.layouts and all(not is_sparse_stl(stl) for stl in x.layouts):
@@ -784,31 +784,27 @@ def _reinterpret_layout(
     return [out_stl]
 
 
-def _compact_layout(
+def _compact_relabel_layout(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
-    """Layout for spyre::compact (keepdim=True path only).
+    """Layout for spyre::compact_relabel (sparse → dense zero-cost relabel).
 
-    compact converts a sparse layout to dense via a zero-cost in-place
-    reinterpretation of the producer buffer.  The output is always the
-    default dense STL for the output host shape; the input is required to
-    present that same dense STL (which costs 0 when the input is sparse —
-    the REINTERPRET sentinel fires in EdgeCostMap._compute_and_cache_cost).
-
-    Only fires on buffers tagged with SPYRE_COMPACT_KEEPDIM_TRUE_ATTR — the
-    keepdim=False path's intermediate buffers (reinterpret/permute/clone)
-    have natural layouts driven by their own ops.
+    compact_relabel converts a sparse layout to dense via a zero-cost
+    in-place reinterpretation of the producer buffer.  The output is always
+    the default dense STL for the output host shape; the input is required
+    to present that same dense STL (which costs 0 when the input is sparse
+    — the REINTERPRET sentinel fires in EdgeCostMap._compute_and_cache_cost).
 
     This cannot fall through to the default single-arg Pointwise handler:
-    that handler tries to preserve the input's stick expression, which would
-    propagate a sparse input STL forward and leave the output sparse —
-    defeating compact's purpose.  AnyInNode is also wrong here (it's for
-    clone, which absorbs layout mismatches as a restickify); compact emits
-    a real identity OpSpec, so the zero-cost REINTERPRET edge has to be
-    what bridges sparse → dense.
+    that handler tries to preserve the input's stick expression, which
+    would propagate a sparse input STL forward and leave the output sparse
+    — defeating compact_relabel's purpose.  AnyInNode is also wrong here
+    (it's for clone, which absorbs layout mismatches as a restickify);
+    compact_relabel emits a real identity OpSpec, so the zero-cost
+    REINTERPRET edge has to be what bridges sparse → dense.
     """
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
@@ -866,18 +862,6 @@ def compute_layouts(
     if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
         return _topk_layouts(op, output, output_dep, args)
 
-    # Check for reinterpret marker set by _lower_reinterpret_impl — this fires
-    # even when the buffer was created without an FX origin (e.g. from
-    # lower_compact).  Marker is attached to the ComputedBuffer (op).
-    if getattr(op, SPYRE_REINTERPRET_ATTR, False):
-        return _reinterpret_layout(op, output, output_dep, args)
-
-    # Check for compact keepdim=True marker — fires only on the canonical
-    # compact buffer (not on internal buffers from lower_compact's
-    # keepdim=False reinterpret -> permute -> clone -> slice -> squeeze chain).
-    if getattr(op, SPYRE_COMPACT_KEEPDIM_TRUE_ATTR, False):
-        return _compact_layout(op, output, output_dep, args)
-
     aten_op = next(iter(data.origins)).target if data.origins else None
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
@@ -892,6 +876,9 @@ def compute_layouts(
 
     if aten_op == spyreop.reinterpret.default:
         return _reinterpret_layout(op, output, output_dep, args)
+
+    if aten_op == spyreop.compact_relabel.default:
+        return _compact_relabel_layout(op, output, output_dep, args)
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of

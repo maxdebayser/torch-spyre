@@ -760,32 +760,36 @@ def conv2d_via_bmm_decomp(
 
 @register_spyre_decomposition([torch.ops.spyre.compact.default])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
-    """Decompose spyre::compact (keepdim=False only).
+    """Decompose spyre::compact into native ops with their own FX origins.
 
-    For keepdim=False (no trailing size-1 dim), expand the sparse stick to a
-    dense one and pick out slot 0:
+    Two paths, distinguished by the trailing dim of the input:
+
+    keepdim=True (trailing size-1):  delegate to spyre::compact_relabel,
+        a dedicated op for the sparse → dense zero-cost relabel.  Its
+        lowering and layout handler stamp the dense default STL on the
+        output buffer, while EdgeCostMap fires REINTERPRET for the
+        sparse → dense transition (no restickify kernel).
+
+    keepdim=False (no trailing size-1):
         reinterpret(x)      # (*S, 64) — slot 0 of each stick is valid
         .transpose(-1, -2)  # (*S[:-1], 64, S[-1]) — move size-64 off stick dim
         .clone()            # dense materialization (FX origin = aten.clone)
         [..., 0:1, :]       # take slot 0 (non-stick axis after permute)
         .squeeze(-2)        # (*S) — pure view
-        * 1.0               # Pointwise mul forces a real ComputedBuffer with
-                            #   the squeezed PyTorch shape; its layout-prop
-                            #   handler assigns the dense default STL for (*S).
+        * 1.0               # Pointwise mul forces a real ComputedBuffer
+                            #   with the squeezed PyTorch shape; its layout-
+                            #   prop handler assigns the dense default STL
+                            #   for (*S).
 
-    Without the trailing mul, AOTAutograd would elide a final .clone() because
-    `squeeze(slice(clone))` is already PyTorch-contiguous, leaving the user-
-    visible output as a bare reinterpret_tensor view of the post-permute clone
-    — which inherits the (*S[:-1], 64, S[-1]) clone's STL, not the desired
-    dense (*S) STL.
-
-    The keepdim=True path (trailing size-1) is left to lower_compact, which
-    uses a Pointwise + REINTERPRET trick that has no aten-level equivalent.
-    Returning NotImplemented signals AOTAutograd to keep the original op.
+    Without the trailing mul, AOTAutograd would elide a final .clone()
+    because `squeeze(slice(clone))` is already PyTorch-contiguous, leaving
+    the user-visible output as a bare reinterpret_tensor view of the
+    post-permute clone — which inherits the (*S[:-1], 64, S[-1]) clone's
+    STL, not the desired dense (*S) STL.
     """
     in_size = list(x.size())
     if in_size and in_size[-1] == 1:
-        return NotImplemented
+        return torch.ops.spyre.compact_relabel(x)
     expanded = torch.ops.spyre.reinterpret(x)
     permuted = expanded.transpose(-1, -2)
     materialized = permuted.clone(memory_format=torch.contiguous_format)

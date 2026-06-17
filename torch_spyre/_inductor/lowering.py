@@ -47,36 +47,6 @@ import logging
 
 logger = get_inductor_logger("lowering")
 
-# Markers attached to ComputedBuffers by lower_compact / _lower_reinterpret_impl.
-# Used by propagate_layouts and spyre_kernel to dispatch on the buffer's role
-# regardless of its FX origin (e.g. when _lower_reinterpret_impl is called
-# internally from lower_compact, the FX origin is spyre.compact, not
-# spyre.reinterpret).  ComputedBuffer is a normal class (not a frozen
-# dataclass), so plain attribute assignment works.
-SPYRE_REINTERPRET_ATTR = "_spyre_is_reinterpret"
-SPYRE_COMPACT_KEEPDIM_TRUE_ATTR = "_spyre_is_compact_keepdim_true"
-
-
-def _get_computed_buffer(pw):
-    """Walk down a realized TensorBox/StorageBox chain to its ComputedBuffer.
-
-    Pointwise.create() returns a TensorBox wrapping a StorageBox wrapping the
-    Pointwise; after pw.realize() the StorageBox.data is replaced with a
-    ComputedBuffer.  Used by lower_compact/_lower_reinterpret_impl to attach
-    role markers (SPYRE_REINTERPRET_ATTR, SPYRE_COMPACT_KEEPDIM_TRUE_ATTR) to
-    the buffer.
-    """
-    from torch._inductor.ir import ComputedBuffer
-
-    node = pw
-    while not isinstance(node, ComputedBuffer) and hasattr(node, "data"):
-        node = node.data
-    assert isinstance(node, ComputedBuffer), (
-        f"expected ComputedBuffer, got {type(node).__name__}"
-    )
-    return node
-
-
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
 _lowerings_lock = threading.RLock()
 _lowerings_nesting = 0
@@ -852,7 +822,8 @@ def lower_restickify(x):
     return pw
 
 
-def _lower_reinterpret_impl(x, origin_node):
+@register_spyre_lowering(torch.ops.spyre.reinterpret)
+def lower_reinterpret(x):
     # spyre::reinterpret injects the stick size as a new innermost PyTorch dim:
     # sparse (*S) → dense (*S, elems_per_stick).
     #
@@ -865,10 +836,6 @@ def _lower_reinterpret_impl(x, origin_node):
     # for host↔device transfer uses the dense (*S, elems_per_stick) layout.
     # The OpSpec replacement in spyre_kernel.py:store builds the correct
     # device coordinates (bypassing compute_coordinates).
-    #
-    # _spyre_reinterpret=True is set on the StorageBox so propagate_layouts
-    # can identify this buffer even when it is created without an FX origin
-    # node (e.g. when called internally from lower_compact).
     base = x
     while not isinstance(base, StorageBox):
         base = base.data
@@ -890,58 +857,27 @@ def _lower_reinterpret_impl(x, origin_node):
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
         ranges=expanded_size,
-        origin_node=origin_node,
+        origin_node=V.get_current_node(),
         traceback=x.get_traceback(),
     )
 
     pw.realize()
-    # Tag the underlying ComputedBuffer so propagate_layouts and spyre_kernel
-    # can detect this is a reinterpret regardless of origin_node (e.g. when
-    # called internally from lower_compact, where the current FX node is
-    # spyre.compact rather than spyre.reinterpret).
-    setattr(_get_computed_buffer(pw), SPYRE_REINTERPRET_ATTR, True)
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.reinterpret)
-def lower_reinterpret(x):
-    return _lower_reinterpret_impl(x, V.get_current_node())
-
-
-@register_spyre_lowering(torch.ops.spyre.compact)
-def lower_compact(x):
-    # compact converts a sparse Spyre layout to a dense one.
+@register_spyre_lowering(torch.ops.spyre.compact_relabel)
+def lower_compact_relabel(x):
+    # spyre::compact_relabel: sparse (*S, 1) → dense (*S, 1) zero-cost layout
+    # relabel.  Emitted by the compact decomposition for the keepdim=True
+    # case.  The output is a Pointwise clone of the sparse input;
+    # _compact_relabel_layout (in propagate_layouts) assigns the dense
+    # default STL, FixedInOutNode requires the input to match, and
+    # EdgeCostMap fires REINTERPRET for the sparse → dense transition (no
+    # restickify kernel).
     #
-    # keepdim=True  (sparse (*S, 1)):  Pointwise clone — _compact_layout assigns
-    #     the default dense STL, FixedInOutNode requires the input to match,
-    #     and EdgeCostMap fires REINTERPRET for the sparse→dense transition
-    #     (zero-cost in-place layout reinterpret, no restickify kernel).
-    #
-    # keepdim=False (sparse (*S)):     reinterpret → permute → clone → slice → squeeze.
-    #     1. reinterpret expands sparse (*S) to dense (*S, 64).  In each stick,
-    #        slot 0 holds the valid sparse element; slots 1..63 are garbage.
-    #     2. permute the last two dims so the size-64 axis (with valid data
-    #        at slot 0) is moved out of the stick position.  Slicing the
-    #        stick dim is not supported by the hardware, so we permute first.
-    #     3. clone materializes a dense buffer in the new layout, where the
-    #        former last dim of (*S) becomes the stick dim.
-    #     4. slice [0:1] on the now-non-stick axis (length 64) keeps slot 0,
-    #        the valid value.
-    #     5. squeeze the size-1 dim → (*S).
-    in_size = [int(s) for s in x.get_size()]
-    if in_size and in_size[-1] != 1:
-        # keepdim=False path.
-        expanded = _lower_reinterpret_impl(x, None)  # (*S, 64)
-        rank = len(expanded.get_size())
-        perm = list(range(rank))
-        perm[-2], perm[-1] = perm[-1], perm[-2]
-        permuted = lowering.permute(expanded, perm)  # swap last two dims
-        materialized = clone(permuted, memory_format=torch.contiguous_format)
-        sliced = lowering.slice_(materialized, dim=-2, start=0, end=1)
-        squeezed = lowering.squeeze(sliced, dim=-2)  # (*S)
-        return squeezed
-
-    # keepdim=True path: Pointwise clone of the sparse input.
+    # The keepdim=False path of compact is handled entirely by the
+    # decomposition (reinterpret → permute → clone → slice → squeeze → mul);
+    # no lowering of spyre::compact is needed.
     base = x
     while not isinstance(base, StorageBox):
         base = base.data
@@ -963,11 +899,6 @@ def lower_compact(x):
     )
 
     pw.realize()
-    # Tag the underlying ComputedBuffer so _compact_layout fires only on the
-    # canonical keepdim=True compact buffer (and not on intermediate buffers
-    # in the keepdim=False reinterpret -> permute -> clone -> slice -> squeeze
-    # chain).
-    setattr(_get_computed_buffer(pw), SPYRE_COMPACT_KEEPDIM_TRUE_ATTR, True)
     return pw
 
 
