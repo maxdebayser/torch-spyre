@@ -798,9 +798,17 @@ def _compact_layout(
     present that same dense STL (which costs 0 when the input is sparse —
     the REINTERPRET sentinel fires in EdgeCostMap._compute_and_cache_cost).
 
-    Only fires on buffers tagged in _spyre_compact_keepdim_true_ids — the
+    Only fires on buffers tagged with SPYRE_COMPACT_KEEPDIM_TRUE_ATTR — the
     keepdim=False path's intermediate buffers (reinterpret/permute/clone)
     have natural layouts driven by their own ops.
+
+    This cannot fall through to the default single-arg Pointwise handler:
+    that handler tries to preserve the input's stick expression, which would
+    propagate a sparse input STL forward and leave the output sparse —
+    defeating compact's purpose.  AnyInNode is also wrong here (it's for
+    clone, which absorbs layout mismatches as a restickify); compact emits
+    a real identity OpSpec, so the zero-cost REINTERPRET edge has to be
+    what bridges sparse → dense.
     """
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
