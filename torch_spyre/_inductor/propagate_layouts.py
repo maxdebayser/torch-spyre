@@ -65,7 +65,6 @@ from .pass_utils import (
     indirect_index_dep_names,
     indirect_load_subs_from_op,
     iter_var_id,
-    is_sparse_stl,
 )
 from .optimize_restickify import AllSameNode, AnyInNode, FixedInOutNode
 from .views import matching_dim
@@ -740,36 +739,16 @@ def _reinterpret_layout(
     """Layout for spyre::reinterpret.
 
     reinterpret expands a sparse (*S) tensor to a dense (*S, elems_per_stick)
-    view — same physical bytes, new innermost host dim.
+    Pointwise buffer.  The output has host shape (*S, elems_per_stick) and
+    needs a standard dense layout for that shape.
 
-    The output STL is derived from the input sparse STL: same device_size,
-    stride_map with the final -1 (synthetic stick slot) replaced by 1
-    (each stick slot maps to offset 1 in the new innermost host dim).
-
-    If the input is already dense (not sparse), fall back to the default
-    dense STL for the expanded host shape.
+    The input's sparse STL is read by the OpSpec replacement in spyre_kernel.py
+    (not here); this function only assigns the output layout.
 
     AnyInNode: no restickify is required on the input edge.
     """
     op.restick_cost_fn = AnyInNode(op)
     c_size = [concretize_expr(s) for s in output.size]
-
-    # Try to derive the expanded STL from the input sparse STL.
-    if args:
-        in_stl = args[0].layout
-        if is_sparse_stl(in_stl):
-            # Build expanded STL: same device_size, stride_map[-1] = 1
-            new_stride_map = list(in_stl.stride_map[:-1]) + [1]
-            return [
-                SpyreTensorLayout(
-                    list(in_stl.device_size),
-                    new_stride_map,
-                    in_stl.device_dtype,
-                    in_stl.element_arrangement,
-                )
-            ]
-
-    # Fallback: default dense layout for the expanded host shape.
     return [SpyreTensorLayout(c_size, output.dtype)]
 
 

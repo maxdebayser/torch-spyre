@@ -275,3 +275,152 @@ def test_compact_dense_input_no_reinterpret():
     _, plans = _capture_plans(fn, [x_spyre])
     # The reinterpret plan may or may not fire; what matters is no crash.
     # (This is a smoke test for the no-op path.)
+
+
+# -------- spyre::reinterpret standalone tests --------
+
+
+def test_reinterpret_2d_shape():
+    """reinterpret on sparse (4, 48) → output shape is (4, 48, 64)."""
+
+    def fn(x):
+        sparse = torch.sum(x, dim=-1, keepdim=False)
+        return torch.ops.spyre.reinterpret(sparse)
+
+    x = torch.ones(4, 48, 128, dtype=torch.float16)
+    x_spyre = x.to(DEVICE)
+    result = _compile_and_run(fn, [x_spyre], DEVICE)
+    assert list(result.shape) == [4, 48, 64], f"Unexpected shape: {result.shape}"
+
+
+def test_reinterpret_2d_no_crash():
+    """reinterpret on sparse (4, 48) compiles and produces correct values."""
+
+    def fn(x):
+        sparse = torch.sum(x, dim=-1, keepdim=False)
+        return torch.ops.spyre.reinterpret(sparse)
+
+    x = torch.ones(4, 48, 128, dtype=torch.float16)
+    x_spyre = x.to(DEVICE)
+    result = _compile_and_run(fn, [x_spyre], DEVICE)
+    assert list(result.shape) == [4, 48, 64], f"Unexpected shape: {result.shape}"
+    assert (result == 128.0).all(), f"Expected all 128.0, got {result.unique()}"
+
+
+def test_reinterpret_2d_values_arange():
+    """reinterpret: per-row sum value is broadcast across all 64 stick slots.
+
+    x[b, m, :] = [m, m, ..., m] (row value is m), so sum = 128*m.
+    After reinterpret, result[b, m, i] == 128*m for all i in 0..63.
+    """
+
+    def fn(x):
+        sparse = torch.sum(x, dim=-1, keepdim=False)
+        return torch.ops.spyre.reinterpret(sparse)
+
+    # shape (4, 48, 128): row (b, m) has all values == m
+    row_vals = (
+        torch.arange(48, dtype=torch.float16).reshape(1, 48, 1).expand(4, 48, 128)
+    )
+    x = row_vals.contiguous()
+    x_spyre = x.to(DEVICE)
+    result = _compile_and_run(fn, [x_spyre], DEVICE)
+
+    assert list(result.shape) == [4, 48, 64], f"Unexpected shape: {result.shape}"
+    # expected[b, m, i] = 128 * m for all b, i
+    expected = (
+        (128.0 * torch.arange(48, dtype=torch.float16))
+        .reshape(1, 48, 1)
+        .expand(4, 48, 64)
+    )
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "B,M,K",
+    [
+        (1, 48, 128),  # batch=1
+        (8, 192, 64),  # larger batch and rows, K=64 (one stick)
+        (2, 96, 256),  # wider reduction dim
+    ],
+)
+def test_reinterpret_shapes(B, M, K):
+    """reinterpret: correct output shape and uniform values for various 3D input shapes."""
+
+    def fn(x):
+        sparse = torch.sum(x, dim=-1, keepdim=False)
+        return torch.ops.spyre.reinterpret(sparse)
+
+    x = torch.ones(B, M, K, dtype=torch.float16)
+    x_spyre = x.to(DEVICE)
+    result = _compile_and_run(fn, [x_spyre], DEVICE)
+
+    elems = 64  # fp16 elems per stick
+    assert list(result.shape) == [B, M, elems], f"Unexpected shape: {result.shape}"
+    assert (result == float(K)).all(), f"Expected all {float(K)}, got {result.unique()}"
+
+
+def test_reinterpret_4d_values():
+    """reinterpret on 4D sparse (B, D, M): output shape (B, D, M, 64) with correct values."""
+
+    def fn(x):
+        sparse = torch.sum(x, dim=-1, keepdim=False)
+        return torch.ops.spyre.reinterpret(sparse)
+
+    x = torch.ones(2, 4, 48, 128, dtype=torch.float16)
+    x_spyre = x.to(DEVICE)
+    result = _compile_and_run(fn, [x_spyre], DEVICE)
+
+    assert list(result.shape) == [2, 4, 48, 64], f"Unexpected shape: {result.shape}"
+    assert (result == 128.0).all(), f"Expected all 128.0, got {result.unique()}"
+
+
+def test_reinterpret_4d_values_arange():
+    """reinterpret on 4D input: per-row sum broadcast across all 64 stick slots.
+
+    x[b, d, m, :] = m, so sum = 128*m.
+    After reinterpret, result[b, d, m, i] == 128*m for all i in 0..63.
+    """
+
+    def fn(x):
+        sparse = torch.sum(x, dim=-1, keepdim=False)
+        return torch.ops.spyre.reinterpret(sparse)
+
+    row_vals = (
+        torch.arange(48, dtype=torch.float16).reshape(1, 1, 48, 1).expand(2, 4, 48, 128)
+    )
+    x = row_vals.contiguous()
+    x_spyre = x.to(DEVICE)
+    result = _compile_and_run(fn, [x_spyre], DEVICE)
+
+    assert list(result.shape) == [2, 4, 48, 64], f"Unexpected shape: {result.shape}"
+    expected = (
+        (128.0 * torch.arange(48, dtype=torch.float16))
+        .reshape(1, 1, 48, 1)
+        .expand(2, 4, 48, 64)
+    )
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "B,D,M,K",
+    [
+        (1, 2, 96, 64),  # batch=1, K=64 (one stick)
+        (4, 2, 48, 128),  # standard 4D
+        (2, 8, 48, 64),  # more depth, K=64
+    ],
+)
+def test_reinterpret_4d_shapes(B, D, M, K):
+    """reinterpret: correct output shape and values for various 4D input shapes."""
+
+    def fn(x):
+        sparse = torch.sum(x, dim=-1, keepdim=False)
+        return torch.ops.spyre.reinterpret(sparse)
+
+    x = torch.ones(B, D, M, K, dtype=torch.float16)
+    x_spyre = x.to(DEVICE)
+    result = _compile_and_run(fn, [x_spyre], DEVICE)
+
+    elems = 64
+    assert list(result.shape) == [B, D, M, elems], f"Unexpected shape: {result.shape}"
+    assert (result == float(K)).all(), f"Expected all {float(K)}, got {result.unique()}"

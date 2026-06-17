@@ -33,7 +33,6 @@ from .constants import (
 import torch_spyre._inductor.customops  # noqa: F401
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import (
-    FixedTiledLayout,
     SpyreReduction,
     SpyreConstantFallback,
     SpyreEmptyFallback,
@@ -825,54 +824,44 @@ def lower_restickify(x):
 @register_spyre_lowering(torch.ops.spyre.reinterpret)
 def lower_reinterpret(x):
     # spyre::reinterpret injects the stick size as a new innermost PyTorch dim:
-    # sparse (*S) → dense (*S, elems_per_stick).  Same physical bytes, no copy.
+    # sparse (*S) → dense (*S, elems_per_stick).
     #
-    # It lowers to a ReinterpretView — a zero-cost layout swap that shares
-    # storage with the input.  The expanded FixedTiledLayout is derived from
-    # the default sparse STL for the input host shape:
-    #   - same device_size as the sparse layout for (*S)
-    #   - stride_map with the final -1 (synthetic stick slot) replaced by 1,
-    #     so each stick slot maps to host offset 1 in the new innermost dim
+    # Lowers to a Pointwise op over the expanded shape (*S, elems_per_stick).
+    # The loader ignores the innermost index and reads from the sparse input
+    # using only the outer (*S) indices — each sparse element occupies one
+    # stick, and this Pointwise broadcasts it across all 64 stick slots.
     #
-    # No kernel is emitted; no copy is performed.
-    x.realize()
+    # A real output buffer is allocated (not a view), so the DCI generated
+    # for host↔device transfer uses the dense (*S, elems_per_stick) layout.
+    # The OpSpec replacement in spyre_kernel.py:store builds the correct
+    # device coordinates (bypassing compute_coordinates).
+    base = x
+    while not isinstance(base, StorageBox):
+        base = base.data
 
-    in_size = [int(s) for s in x.get_size()]
+    base.realize()
+
+    in_size = [int(s) for s in base.get_size()]
     elems = SpyreTensorLayout([1], x.get_dtype()).elems_per_stick()
     expanded_size = in_size + [elems]
 
-    # Compute the sparse STL for the input shape (*S) — default tiling with
-    # a trailing -1 in dim_order.  This is the canonical sparse layout.
-    in_strides = [1] * len(in_size)
-    for i in range(len(in_size) - 2, -1, -1):
-        in_strides[i] = in_strides[i + 1] * in_size[i + 1]
-    sparse_stl = SpyreTensorLayout(
-        in_size, in_strides, x.get_dtype(), list(range(len(in_size))) + [-1]
+    loader = base.make_loader()
+
+    def inner_fn(index):
+        # index has len(expanded_size) entries; drop the last (stick slot).
+        return loader(list(index[: len(in_size)]))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=expanded_size,
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
     )
 
-    # Build the expanded STL: same device_size, stride_map[-1] = 1.
-    new_stride_map = list(sparse_stl.stride_map[:-1]) + [1]
-    expanded_stl = SpyreTensorLayout(
-        list(sparse_stl.device_size),
-        new_stride_map,
-        sparse_stl.device_dtype,
-        sparse_stl.element_arrangement,
-    )
-
-    # Row-major host strides for the expanded host shape (*S, elems).
-    expanded_stride = [1] * len(expanded_size)
-    for i in range(len(expanded_size) - 2, -1, -1):
-        expanded_stride[i] = expanded_stride[i + 1] * expanded_size[i + 1]
-
-    expanded_layout = FixedTiledLayout(
-        x.get_device(),
-        x.get_dtype(),
-        expanded_size,
-        expanded_stride,
-        expanded_stl,
-    )
-
-    return ir.TensorBox(ir.ReinterpretView(data=x.data, layout=expanded_layout))
+    pw.realize()
+    return pw
 
 
 @register_spyre_lowering(torch.ops.spyre.compact)
