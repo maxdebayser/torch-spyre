@@ -96,12 +96,11 @@ def test_compact_reduction_sparse_no_restickify():
     _assert_has_reinterpret(plans["reinterpret_plan"])
 
 
-# M=64 (M equals stick size for fp16) hits the same _reinterpret_coords
-# ambiguity that other reinterpret tests skip — see "Known limitations" in
-# DESIGN.md.  Sizes here all avoid that case.
 @pytest.mark.parametrize(
     "M,K",
     [
+        (64, 128),  # M==elems_per_stick: regression for size-collision
+        (64, 64),  # M==elems_per_stick: regression for size-collision
         (128, 128),
         (192, 128),
         (256, 128),
@@ -372,6 +371,7 @@ def test_reinterpret_2d_values_arange():
         (1, 48, 128),  # batch=1
         (8, 192, 64),  # larger batch and rows, K=64 (one stick)
         (2, 96, 256),  # wider reduction dim
+        (4, 64, 128),  # M==elems_per_stick: regression for size-collision
     ],
 )
 def test_reinterpret_shapes(B, M, K):
@@ -438,6 +438,7 @@ def test_reinterpret_4d_values_arange():
         (1, 2, 96, 64),  # batch=1, K=64 (one stick)
         (4, 2, 48, 128),  # standard 4D
         (2, 8, 48, 64),  # more depth, K=64
+        (2, 4, 64, 128),  # M==elems_per_stick: regression for size-collision
     ],
 )
 def test_reinterpret_4d_shapes(B, D, M, K):

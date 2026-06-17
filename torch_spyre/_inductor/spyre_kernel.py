@@ -920,35 +920,56 @@ def _is_reinterpret_node(current_node: Any) -> bool:
 def _reinterpret_coords(
     device_size: "list[int]",
     stride_map: "list[int]",
+    index: "sympy.Expr",
     it_space: "dict[sympy.Symbol, sympy.Expr]",
 ) -> "list[sympy.Expr]":
     """Build device coordinates for a reinterpret TensorArg without compute_coordinates.
 
-    The iteration space for reinterpret on sparse (B, M) is {c0:B, c1:M, c2:64}.
+    Each iteration symbol's coefficient in the tensor's host index expression
+    is its host stride.  Matching ``stride_map[i]`` to the symbol with that
+    same host stride coefficient picks the right symbol regardless of how
+    sizes happen to coincide (e.g. M==elems_per_stick=64 for fp16, where two
+    real dims share device_size).
 
-    Sparse input device_size=[M, 1, B, 64], stride_map=[1, -1, 48, -1]:
-      dim0 size=M  stride=1  → c1   (real dim, match by size)
-      dim1 size=1            → 0    (size-1 dim)
-      dim2 size=B  stride=48 → c0   (real dim, match by size)
-      dim3 size=64 stride=-1 → 0    (synthetic stick: one element per stick, no host dim)
+    For sparse input (4, M=48) with index ``128*d0 + d2``:
+      d0 has coefficient 128 → that's the host stride of PyTorch dim 0 (M=48,
+      so stride 128 belongs to the leading dim).  d2 has coefficient 1 → the
+      innermost host dim.
+      Sparse device_size=[48, 1, 4, 64], stride_map=[1, -1, 128, -1]:
+        dim0 stride_map=1   → coef-1 symbol = d2 → c=d2
+        dim1 size=1                              → c=0
+        dim2 stride_map=128 → coef-128 symbol = d0 → c=d0
+        dim3 stride_map=-1                       → c=0 (synthetic stick)
 
-    Dense output device_size=[M, 1, B, 64], stride_map=[1, -1, 48, 1]:
-      dim0 size=M  stride=1  → c1   (real dim)
-      dim1 size=1            → 0    (size-1 dim)
-      dim2 size=B  stride=48 → c0   (real dim)
-      dim3 size=64 stride=1  → c2   (real innermost host dim — the 64 stick slots)
+    For dense output (4, M=48, 64) with index ``8192*d0 + d1 + 64*d2``
+    (note: d1 is the new stick symbol, coefficient 1; d2 is the M symbol):
+      Dense device_size=[48, 1, 4, 64], stride_map=[64, 64, 8192, 1]:
+        dim0 stride_map=64   → coef-64 symbol = d2 → c=d2
+        dim1 size=1                               → c=0
+        dim2 stride_map=8192 → coef-8192 symbol = d0 → c=d0
+        dim3 stride_map=1    → coef-1 symbol = d1 → c=d1
 
-    Rule: synthetic dims (stride_map==-1) and size-1 dims → coordinate 0.
-    Real dims (stride_map!=-1) → match iteration symbol by size.
+    Symbols that don't appear in the index (i.e. coefficient 0) are skipped
+    when building the lookup table — they correspond to dims that this tensor
+    doesn't see (e.g. the stick symbol in the sparse input's index).
     """
-    # Build a map: concrete size → symbol (from iteration space)
-    size_to_sym: dict[int, sympy.Expr] = {}
-    for sym, rng in it_space.items():
-        sz = int(concretize_expr(rng))
-        size_to_sym[sz] = sym
+    # Extract host stride for each iteration symbol from the index expression:
+    # coefficient of `sym` in `index` = host stride of the host dim that `sym`
+    # iterates over.  Symbols absent from the index get coefficient 0 and are
+    # excluded from the lookup table.
+    stride_to_sym: dict[int, sympy.Expr] = {}
+    for sym in it_space.keys():
+        coef = index.coeff(sym)
+        if coef == 0:
+            continue
+        try:
+            stride_to_sym[int(concretize_expr(coef))] = sym
+        except (TypeError, ValueError):
+            # Non-integer coefficient (e.g. symbolic dynamic shape); skip.
+            continue
 
     coords: list[sympy.Expr] = []
-    for i, (ds, sm) in enumerate(zip(device_size, stride_map)):
+    for ds, sm in zip(device_size, stride_map):
         if ds == 1:
             coords.append(sympy.S.Zero)
         elif int(sm) == -1:
@@ -957,9 +978,7 @@ def _reinterpret_coords(
             # (which has stride_map==-1 because there is no real innermost host dim).
             coords.append(sympy.S.Zero)
         else:
-            # Real dim: match by size to an iteration symbol.
-            sym = size_to_sym.get(int(ds), sympy.S.Zero)
-            coords.append(sym)
+            coords.append(stride_to_sym.get(int(sm), sympy.S.Zero))
     return coords
 
 
@@ -971,14 +990,16 @@ def _build_reinterpret_out_arg(
 
     The dense output has stride_map with two dims sharing the same stride
     (e.g. stride_map=[64, 64, 3072, 1] for (4,48,64)), which makes
-    compute_coordinates produce wrong coords.  We bypass it by matching
-    iteration symbols to device dims by size via _reinterpret_coords.
+    compute_coordinates produce wrong coords.  We bypass it by deriving
+    iteration-symbol → host-stride from the index expression in
+    _reinterpret_coords, then matching device dims by stride_map.
     """
     out_layout = expanded_output.layout
     out_stl = out_layout.device_layout
     out_coords = _reinterpret_coords(
         [int(s) for s in out_stl.device_size],
         [int(s) for s in out_stl.stride_map],
+        expanded_output.index,
         it_space,
     )
     return TensorArg(
@@ -1005,8 +1026,9 @@ def _build_reinterpret_opspec(
     output occupy the same physical bytes; the OpSpec is a zero-copy identity.
 
     compute_coordinates cannot handle the expanded stride_map (it produces
-    fractional sympy coefficients), so coords are derived directly from the
-    device_size structure via _reinterpret_coords.
+    fractional sympy coefficients), so coords are derived in _reinterpret_coords
+    by matching each iteration symbol's coefficient in the index expression
+    (its host stride) to the tensor's stride_map.
 
     Iteration space has (host_rank + 1) symbols: host dims + the stick symbol.
     """
@@ -1018,11 +1040,13 @@ def _build_reinterpret_opspec(
     in_coords = _reinterpret_coords(
         [int(s) for s in in_stl.device_size],
         [int(s) for s in in_stl.stride_map],
+        sparse_input.index,
         it_space,
     )
     out_coords = _reinterpret_coords(
         [int(s) for s in out_stl.device_size],
         [int(s) for s in out_stl.stride_map],
+        expanded_output.index,
         it_space,
     )
 
