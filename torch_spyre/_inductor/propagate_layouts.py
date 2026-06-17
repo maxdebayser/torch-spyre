@@ -56,7 +56,7 @@ from .constants import (
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
-from .lowering import _spyre_compact_keepdim_true_ids, _spyre_reinterpret_ids
+from .lowering import SPYRE_COMPACT_KEEPDIM_TRUE_ATTR, SPYRE_REINTERPRET_ATTR
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
@@ -827,16 +827,16 @@ def compute_layouts(
     if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
         return _topk_layouts(op, output, output_dep, args)
 
-    # Check for reinterpret tag set by _lower_reinterpret_impl — this fires even
-    # when the buffer was created without an FX origin (e.g. from lower_compact).
-    # data is the Pointwise (ComputedBuffer.data after realize()).
-    if id(data) in _spyre_reinterpret_ids:
+    # Check for reinterpret marker set by _lower_reinterpret_impl — this fires
+    # even when the buffer was created without an FX origin (e.g. from
+    # lower_compact).  Marker is attached to the ComputedBuffer (op).
+    if getattr(op, SPYRE_REINTERPRET_ATTR, False):
         return _reinterpret_layout(op, output, output_dep, args)
 
-    # Check for compact keepdim=True tag — fires only on the canonical
+    # Check for compact keepdim=True marker — fires only on the canonical
     # compact buffer (not on internal buffers from lower_compact's
     # keepdim=False reinterpret -> permute -> clone -> slice -> squeeze chain).
-    if id(data) in _spyre_compact_keepdim_true_ids:
+    if getattr(op, SPYRE_COMPACT_KEEPDIM_TRUE_ATTR, False):
         return _compact_layout(op, output, output_dep, args)
 
     aten_op = next(iter(data.origins)).target if data.origins else None

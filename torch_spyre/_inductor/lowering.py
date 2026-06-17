@@ -47,20 +47,35 @@ import logging
 
 logger = get_inductor_logger("lowering")
 
-# IDs of Pointwise nodes created by _lower_reinterpret_impl.  Pointwise is a
-# frozen dataclass so we can't set attributes; use a module-level id set instead.
-# propagate_layouts checks this to identify reinterpret buffers regardless of
-# origin_node (e.g. when called internally from lower_compact).
-# TODO: replace with weakref-based marker (see compact/DESIGN.md §16) — id reuse
-# after GC could cause false positives in long-running processes.
-_spyre_reinterpret_ids: set[int] = set()
+# Markers attached to ComputedBuffers by lower_compact / _lower_reinterpret_impl.
+# Used by propagate_layouts and spyre_kernel to dispatch on the buffer's role
+# regardless of its FX origin (e.g. when _lower_reinterpret_impl is called
+# internally from lower_compact, the FX origin is spyre.compact, not
+# spyre.reinterpret).  ComputedBuffer is a normal class (not a frozen
+# dataclass), so plain attribute assignment works.
+SPYRE_REINTERPRET_ATTR = "_spyre_is_reinterpret"
+SPYRE_COMPACT_KEEPDIM_TRUE_ATTR = "_spyre_is_compact_keepdim_true"
 
-# IDs of Pointwise nodes created by lower_compact's keepdim=True path.  Used by
-# propagate_layouts._compact_layout to fire only on the canonical compact node
-# (drives the REINTERPRET edge), not on internal buffers from the keepdim=False
-# reinterpret -> permute -> clone -> slice -> squeeze chain.
-# TODO: replace with weakref-based marker (see compact/DESIGN.md §16).
-_spyre_compact_keepdim_true_ids: set[int] = set()
+
+def _get_computed_buffer(pw):
+    """Walk down a realized TensorBox/StorageBox chain to its ComputedBuffer.
+
+    Pointwise.create() returns a TensorBox wrapping a StorageBox wrapping the
+    Pointwise; after pw.realize() the StorageBox.data is replaced with a
+    ComputedBuffer.  Used by lower_compact/_lower_reinterpret_impl to attach
+    role markers (SPYRE_REINTERPRET_ATTR, SPYRE_COMPACT_KEEPDIM_TRUE_ATTR) to
+    the buffer.
+    """
+    from torch._inductor.ir import ComputedBuffer
+
+    node = pw
+    while not isinstance(node, ComputedBuffer) and hasattr(node, "data"):
+        node = node.data
+    assert isinstance(node, ComputedBuffer), (
+        f"expected ComputedBuffer, got {type(node).__name__}"
+    )
+    return node
+
 
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
 _lowerings_lock = threading.RLock()
@@ -879,16 +894,12 @@ def _lower_reinterpret_impl(x, origin_node):
         traceback=x.get_traceback(),
     )
 
-    # Register the Pointwise id in the module-level set so propagate_layouts
-    # can detect it regardless of origin_node (e.g. when called internally
-    # from lower_compact where the current FX node is spyre.compact).
-    # Pointwise is a frozen dataclass so we can't set attributes directly.
-    pw_node = pw
-    while not isinstance(pw_node, Pointwise):
-        pw_node = pw_node.data
-    _spyre_reinterpret_ids.add(id(pw_node))
-
     pw.realize()
+    # Tag the underlying ComputedBuffer so propagate_layouts and spyre_kernel
+    # can detect this is a reinterpret regardless of origin_node (e.g. when
+    # called internally from lower_compact, where the current FX node is
+    # spyre.compact rather than spyre.reinterpret).
+    setattr(_get_computed_buffer(pw), SPYRE_REINTERPRET_ATTR, True)
     return pw
 
 
@@ -952,13 +963,11 @@ def lower_compact(x):
     )
 
     pw.realize()
-    # Tag the underlying Pointwise so _compact_layout fires only on the canonical
-    # keepdim=True compact buffer (and not on intermediate buffers in the
-    # keepdim=False reinterpret -> permute -> clone -> slice -> squeeze chain).
-    pw_node = pw
-    while hasattr(pw_node, "data") and not isinstance(pw_node, Pointwise):
-        pw_node = pw_node.data
-    _spyre_compact_keepdim_true_ids.add(id(pw_node))
+    # Tag the underlying ComputedBuffer so _compact_layout fires only on the
+    # canonical keepdim=True compact buffer (and not on intermediate buffers
+    # in the keepdim=False reinterpret -> permute -> clone -> slice -> squeeze
+    # chain).
+    setattr(_get_computed_buffer(pw), SPYRE_COMPACT_KEEPDIM_TRUE_ATTR, True)
     return pw
 
 
