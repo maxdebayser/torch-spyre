@@ -21,7 +21,7 @@ from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
 from .optimize_restickify import _ReinterpretSentinel
-from .pass_utils import compute_compact_dense_stl, copy_fx_custom_meta
+from .pass_utils import copy_fx_custom_meta
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -66,29 +66,34 @@ def _record_restickify(
 
 def _record_reinterpret(
     dep_name: str,
-    dense_layout: FixedTiledLayout,
+    rewrite_layout: FixedTiledLayout,
     reinterpret_plan: dict,
 ) -> None:
     """Record that the producer buffer dep_name should be reinterpreted in place
-    to dense_layout (no kernel, no FX node).
+    to rewrite_layout (no kernel, no FX node).
 
     reinterpret_plan maps buffer name -> target FixedTiledLayout.
     """
-    reinterpret_plan[dep_name] = dense_layout
+    reinterpret_plan[dep_name] = rewrite_layout
 
 
 def _apply_reinterpret_on_producer(
     dep_name: str,
-    dense_layout: FixedTiledLayout,
+    rewrite_layout: FixedTiledLayout,
     graph: GraphLowering,
 ) -> None:
-    """Rewrite the producer buffer's FixedTiledLayout in place to dense_layout.
+    """Rewrite the producer buffer's FixedTiledLayout in place to rewrite_layout.
+
+    Used by both REINTERPRET flavours (see EdgeCostMap):
+    - sparse → dense (spyre::compact)
+    - sparse → sparse with a different synthetic-stick PyTorch dim
+      (spyre::reinterpret).
 
     Preconditions (checked defensively):
-    - The buffer's current STL must differ from dense_layout (already dense → skip).
+    - The buffer's current STL must differ from rewrite_layout (no-op rewrite).
     No FX node is inserted; no OpSpec is created. The consumer kernel will read
-    the same bytes under the new dense STL because TensorArg is snapshotted at
-    codegen time from the buffer's current layout.
+    the same bytes under the new STL because TensorArg is snapshotted at codegen
+    time from the buffer's current layout.
     """
     input_buf = graph.get_buffer(dep_name)
     if input_buf is None:
@@ -104,14 +109,18 @@ def _apply_reinterpret_on_producer(
         )
         return
     current_stl = current_layout.device_layout
-    if current_stl == dense_layout.device_layout:
-        logger.warning(f"reinterpret: buffer {dep_name!r} is already dense, skipping")
+    if current_stl == rewrite_layout.device_layout:
+        logger.warning(
+            f"reinterpret: buffer {dep_name!r} already has target STL, skipping"
+        )
         return
     logger.info(
         f"Reinterpreting {dep_name!r} in place: "
-        f"sparse {list(current_stl.device_size)} -> dense {list(dense_layout.device_layout.device_size)}"
+        f"{list(current_stl.device_size)} stride_map={list(current_stl.stride_map)} "
+        f"-> {list(rewrite_layout.device_layout.device_size)} "
+        f"stride_map={list(rewrite_layout.device_layout.stride_map)}"
     )
-    input_buf.layout = dense_layout
+    input_buf.layout = rewrite_layout
 
 
 class NameSwapHandler(WrapperHandler):
@@ -262,8 +271,8 @@ def insert_restickify(graph: GraphLowering) -> None:
     # Apply reinterprets first — these must happen before restickify insertion
     # so that subsequent consumers see the updated layout.
     reinterpret_plan = getattr(graph, "reinterpret_plan", {})
-    for dep_name, dense_layout in reinterpret_plan.items():
-        _apply_reinterpret_on_producer(dep_name, dense_layout, graph)
+    for dep_name, rewrite_layout in reinterpret_plan.items():
+        _apply_reinterpret_on_producer(dep_name, rewrite_layout, graph)
 
     operations = graph.operations
     restickify_plan = graph.restickify_plan
@@ -342,21 +351,22 @@ def finalize_layouts(graph: GraphLowering) -> None:
             if result is None:
                 continue
             if isinstance(result, _ReinterpretSentinel):
-                dense_stl = compute_compact_dense_stl(in_stl, in_layout)
-                if dense_stl is None:
-                    # Fallback: shouldn't happen since REINTERPRET implies sparse,
-                    # but guard defensively and fall through to restickify path.
-                    logger.warning(
-                        f"REINTERPRET sentinel on {edge.dep.name} but "
-                        "compute_compact_dense_stl returned None; falling back to restickify"
-                    )
-                    continue
-                dense_target = _fixed_tiled(in_layout, dense_stl)
+                # REINTERPRET fires for two cases (see EdgeCostMap._compute_and_cache_cost):
+                #   (a) sparse → dense, same host shape (spyre::compact).
+                #   (b) sparse → sparse with a different synthetic-stick PyTorch
+                #       dim, same host shape (spyre::reinterpret accepting any
+                #       upstream sparse layout).
+                # In both cases the producer's bytes are identical to what the
+                # consumer wants — the rewrite target is exactly target_stl, no
+                # recomputation needed.  We just rewrite the producer's
+                # FixedTiledLayout in place.
+                rewrite_target = _fixed_tiled(in_layout, target_stl)
                 logger.info(
                     f"Scheduling reinterpret on {edge.dep.name}: "
-                    f"sparse {list(in_stl.device_size)} -> dense {list(dense_stl.device_size)}"
+                    f"{list(in_stl.device_size)} stride_map={list(in_stl.stride_map)} "
+                    f"-> {list(target_stl.device_size)} stride_map={list(target_stl.stride_map)}"
                 )
-                _record_reinterpret(edge.dep.name, dense_target, reinterpret_plan)
+                _record_reinterpret(edge.dep.name, rewrite_target, reinterpret_plan)
             else:
                 restick_target = _fixed_tiled(in_layout, result)
                 logger.info(

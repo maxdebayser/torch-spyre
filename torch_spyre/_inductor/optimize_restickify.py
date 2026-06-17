@@ -39,6 +39,7 @@ from .pass_utils import (
     compute_restickify_needed,
     device_coordinates,
     host_coordinates,
+    is_sparse_stl,
 )
 
 INF = math.inf
@@ -106,16 +107,51 @@ class EdgeCostMap:
         Cost is 0 if stick-compatible or a zero-cost reinterpret is possible,
         the input element count if restickifiable, or INF if infeasible.
 
-        When in_stl is sparse and target_stl is the corresponding dense layout
-        (same host shape, same physical bytes), the transition is recorded as
-        REINTERPRET — zero cost, no kernel. finalize_layouts/insert_restickify
-        will rewrite the producer buffer's FixedTiledLayout in place instead of
-        inserting a restickify node.
+        Two flavours of zero-cost REINTERPRET (in-place metadata rewrite, no
+        kernel) are recognised:
+
+        1. Sparse → dense, same host shape.  The producer wrote the canonical
+           sparse byte pattern (one valid element per stick, 63 garbage slots);
+           a dense view of the same bytes is the result of
+           compute_compact_dense_stl.  Used by spyre::compact (keepdim=True).
+
+        2. Sparse → sparse, same host shape, only the synthetic-stick PyTorch
+           dim differs.  A sparse stick holds a single valid element; slots
+           1..63 are garbage.  Therefore the bytes are independent of which
+           PyTorch dim the synthetic stick is glued to — the choice is purely
+           metadata.  Two sparse STLs over the same host shape (and same
+           element_arrangement) describe the same bytes; we can relabel one
+           as the other for free.  Used by spyre::reinterpret to accept any
+           upstream sparse layout regardless of which dim the producing
+           reduction chose as its stick.
+
+        finalize_layouts/insert_restickify will rewrite the producer buffer's
+        FixedTiledLayout in place to target_stl when REINTERPRET fires.
         """
-        # Sparse-to-dense: zero-cost reinterpret if the input is sparse and the
-        # dense STL for the same host layout matches target_stl.
+        # (1) Sparse-to-dense: zero-cost reinterpret if the input is sparse
+        # and the dense STL for the same host layout matches target_stl.
         dense_stl = compute_compact_dense_stl(in_stl, self._dep_layout)
         if dense_stl is not None and dense_stl == target_stl:
+            self._cost[in_stl][target_stl] = 0.0
+            self._layout[in_stl][target_stl] = REINTERPRET
+            return
+
+        # (2) Sparse-to-sparse with same host shape: zero-cost relabel.  Both
+        # the producer's STL and the requested STL describe one valid element
+        # per stick over the same host buffer, so the underlying bytes are
+        # identical regardless of which PyTorch dim the synthetic stick is
+        # attached to.  in_stl and target_stl must agree on element_arrangement
+        # — that's a real bit-level layout difference, not metadata-only.
+        # The dense_stl is None branch above covers degenerate "sparse" STLs
+        # whose host has all size-1 dims (where sparse and dense are
+        # indistinguishable); for those, a "different sparse" target_stl would
+        # also be byte-identical and falls through here harmlessly.
+        if (
+            is_sparse_stl(in_stl)
+            and is_sparse_stl(target_stl)
+            and in_stl != target_stl
+            and in_stl.element_arrangement == target_stl.element_arrangement
+        ):
             self._cost[in_stl][target_stl] = 0.0
             self._layout[in_stl][target_stl] = REINTERPRET
             return

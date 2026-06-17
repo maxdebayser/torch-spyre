@@ -259,22 +259,26 @@ def test_compact_3d_layouts():
 # -------- Negative test: dense input should not reinterpret --------
 
 
-def test_compact_dense_input_no_reinterpret():
-    """compact on a dense-output reduction: no reinterpret needed."""
+def test_compact_dense_input_rejected():
+    """compact on a dense input (non-stick-dim reduction) raises an error.
+
+    Previously this silently miscompiled: the keepdim=False chain's
+    reinterpret kernel produced 64 copies of one input element per stick
+    instead of the original 64 distinct values.  The propagator now rejects
+    dense input to spyre::reinterpret so the failure is loud rather than
+    silent.
+    """
 
     def fn(x):
-        # sum over dim=0 (non-stick dim) produces dense output
+        # sum over dim=0 (non-stick dim) produces dense output — invalid for compact.
         y = torch.sum(x, dim=0, keepdim=True)
         y = torch.ops.spyre.compact(y)
         return y + y
 
-    # Use a dense (non-sparse) tensor produced by a reduction that doesn't
-    # create a sparse layout — we check the plan rather than the layout type.
     x = torch.ones(64, 192, dtype=torch.float16)
     x_spyre = x.to(DEVICE)
-    _, plans = _capture_plans(fn, [x_spyre])
-    # The reinterpret plan may or may not fire; what matters is no crash.
-    # (This is a smoke test for the no-op path.)
+    with pytest.raises(Exception, match="sparse input"):
+        _compile_and_run(fn, [x_spyre], DEVICE)
 
 
 # -------- Tests: keepdim=False (3D input → 2D sparse → compact → 2D dense) --------
