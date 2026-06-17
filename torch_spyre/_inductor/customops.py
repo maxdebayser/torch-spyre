@@ -340,6 +340,22 @@ def _(x: torch.Tensor) -> torch.Tensor:
     return x.new_empty(x.size())
 
 
+@torch.library.custom_op("spyre::reinterpret", mutates_args=(), device_types="spyre")
+def reinterpret(  # type: ignore[empty-body]
+    x: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+
+@reinterpret.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    from torch_spyre._C import SpyreTensorLayout
+
+    elems = SpyreTensorLayout([1], x.dtype).elems_per_stick()
+    expanded_size = list(x.size()) + [elems]
+    return x.new_empty(expanded_size)
+
+
 @torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
 def max_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
