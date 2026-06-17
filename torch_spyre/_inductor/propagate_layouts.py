@@ -56,6 +56,7 @@ from .constants import (
     TOPK_OPS,
 )
 from .ir import FixedTiledLayout, SpyreConstantFallback
+from .lowering import _spyre_compact_keepdim_true_ids, _spyre_reinterpret_ids
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
@@ -758,13 +759,17 @@ def _compact_layout(
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
-    """Layout for spyre::compact.
+    """Layout for spyre::compact (keepdim=True path only).
 
     compact converts a sparse layout to dense via a zero-cost in-place
     reinterpretation of the producer buffer.  The output is always the
     default dense STL for the output host shape; the input is required to
     present that same dense STL (which costs 0 when the input is sparse —
     the REINTERPRET sentinel fires in EdgeCostMap._compute_and_cache_cost).
+
+    Only fires on buffers tagged in _spyre_compact_keepdim_true_ids — the
+    keepdim=False path's intermediate buffers (reinterpret/permute/clone)
+    have natural layouts driven by their own ops.
     """
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
@@ -822,6 +827,18 @@ def compute_layouts(
     if isinstance(data, Reduction) and data.reduction_type in TOPK_OPS:
         return _topk_layouts(op, output, output_dep, args)
 
+    # Check for reinterpret tag set by _lower_reinterpret_impl — this fires even
+    # when the buffer was created without an FX origin (e.g. from lower_compact).
+    # data is the Pointwise (ComputedBuffer.data after realize()).
+    if id(data) in _spyre_reinterpret_ids:
+        return _reinterpret_layout(op, output, output_dep, args)
+
+    # Check for compact keepdim=True tag — fires only on the canonical
+    # compact buffer (not on internal buffers from lower_compact's
+    # keepdim=False reinterpret -> permute -> clone -> slice -> squeeze chain).
+    if id(data) in _spyre_compact_keepdim_true_ids:
+        return _compact_layout(op, output, output_dep, args)
+
     aten_op = next(iter(data.origins)).target if data.origins else None
     if aten_op == spyreop.layernormnorm.default:
         # layernormnorm is pointwise but special: it has multiple args, input and
@@ -836,9 +853,6 @@ def compute_layouts(
 
     if aten_op == spyreop.reinterpret.default:
         return _reinterpret_layout(op, output, output_dep, args)
-
-    if aten_op == spyreop.compact.default:
-        return _compact_layout(op, output, output_dep, args)
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of

@@ -893,14 +893,25 @@ class SpyreKernel(Kernel[CSEVariable]):
 
 
 def _is_reinterpret_node(current_node: Any) -> bool:
-    """Return True if current_node is a spyre::reinterpret node."""
+    """Return True if current_node is a spyre::reinterpret node.
+
+    Detects reinterpret buffers two ways:
+    - FX origin contains spyre::reinterpret (the standalone-call case).
+    - Pointwise id is registered in _spyre_reinterpret_ids (used when
+      _lower_reinterpret_impl is called internally from lower_compact, in
+      which case the FX origin is spyre::compact rather than spyre::reinterpret).
+    """
     try:
         data = current_node.node.data
         origins: set = getattr(data, "origins", set())
-        return bool(origins) and any(
+        if bool(origins) and any(
             getattr(n, "target", None) is torch.ops.spyre.reinterpret.default
             for n in origins
-        )
+        ):
+            return True
+        from .lowering import _spyre_reinterpret_ids
+
+        return id(data) in _spyre_reinterpret_ids
     except Exception:
         return False
 

@@ -31,6 +31,7 @@ from .constants import (
     SHARED_WEIGHT_UNIT_BMM_INFO_KEY,
 )
 import torch_spyre._inductor.customops  # noqa: F401
+
 from torch_spyre.ops.fallbacks import fallback_ops
 from .ir import (
     SpyreReduction,
@@ -45,6 +46,21 @@ from .logging_utils import get_inductor_logger
 import logging
 
 logger = get_inductor_logger("lowering")
+
+# IDs of Pointwise nodes created by _lower_reinterpret_impl.  Pointwise is a
+# frozen dataclass so we can't set attributes; use a module-level id set instead.
+# propagate_layouts checks this to identify reinterpret buffers regardless of
+# origin_node (e.g. when called internally from lower_compact).
+# TODO: replace with weakref-based marker (see compact/DESIGN.md §16) — id reuse
+# after GC could cause false positives in long-running processes.
+_spyre_reinterpret_ids: set[int] = set()
+
+# IDs of Pointwise nodes created by lower_compact's keepdim=True path.  Used by
+# propagate_layouts._compact_layout to fire only on the canonical compact node
+# (drives the REINTERPRET edge), not on internal buffers from the keepdim=False
+# reinterpret -> permute -> clone -> slice -> squeeze chain.
+# TODO: replace with weakref-based marker (see compact/DESIGN.md §16).
+_spyre_compact_keepdim_true_ids: set[int] = set()
 
 # A module-level lock + nesting counter to make the CM reentrant/thread-safe
 _lowerings_lock = threading.RLock()
@@ -821,8 +837,7 @@ def lower_restickify(x):
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.reinterpret)
-def lower_reinterpret(x):
+def _lower_reinterpret_impl(x, origin_node):
     # spyre::reinterpret injects the stick size as a new innermost PyTorch dim:
     # sparse (*S) → dense (*S, elems_per_stick).
     #
@@ -835,6 +850,10 @@ def lower_reinterpret(x):
     # for host↔device transfer uses the dense (*S, elems_per_stick) layout.
     # The OpSpec replacement in spyre_kernel.py:store builds the correct
     # device coordinates (bypassing compute_coordinates).
+    #
+    # _spyre_reinterpret=True is set on the StorageBox so propagate_layouts
+    # can identify this buffer even when it is created without an FX origin
+    # node (e.g. when called internally from lower_compact).
     base = x
     while not isinstance(base, StorageBox):
         base = base.data
@@ -856,22 +875,62 @@ def lower_reinterpret(x):
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
         ranges=expanded_size,
-        origin_node=V.get_current_node(),
+        origin_node=origin_node,
         traceback=x.get_traceback(),
     )
+
+    # Register the Pointwise id in the module-level set so propagate_layouts
+    # can detect it regardless of origin_node (e.g. when called internally
+    # from lower_compact where the current FX node is spyre.compact).
+    # Pointwise is a frozen dataclass so we can't set attributes directly.
+    pw_node = pw
+    while not isinstance(pw_node, Pointwise):
+        pw_node = pw_node.data
+    _spyre_reinterpret_ids.add(id(pw_node))
 
     pw.realize()
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.reinterpret)
+def lower_reinterpret(x):
+    return _lower_reinterpret_impl(x, V.get_current_node())
+
+
 @register_spyre_lowering(torch.ops.spyre.compact)
 def lower_compact(x):
-    # compact is a zero-cost layout reinterpret at the compiler level.
-    # It lowers to a Pointwise clone so it materializes a fresh dense buffer.
-    # The layout propagation pass (_compact_layout in propagate_layouts.py)
-    # detects the spyre.compact origin and declares the input must present
-    # a dense STL via FixedInOutNode; EdgeCostMap then fires the REINTERPRET
-    # sentinel on the sparse producer instead of inserting a restickify kernel.
+    # compact converts a sparse Spyre layout to a dense one.
+    #
+    # keepdim=True  (sparse (*S, 1)):  Pointwise clone — _compact_layout assigns
+    #     the default dense STL, FixedInOutNode requires the input to match,
+    #     and EdgeCostMap fires REINTERPRET for the sparse→dense transition
+    #     (zero-cost in-place layout reinterpret, no restickify kernel).
+    #
+    # keepdim=False (sparse (*S)):     reinterpret → permute → clone → slice → squeeze.
+    #     1. reinterpret expands sparse (*S) to dense (*S, 64).  In each stick,
+    #        slot 0 holds the valid sparse element; slots 1..63 are garbage.
+    #     2. permute the last two dims so the size-64 axis (with valid data
+    #        at slot 0) is moved out of the stick position.  Slicing the
+    #        stick dim is not supported by the hardware, so we permute first.
+    #     3. clone materializes a dense buffer in the new layout, where the
+    #        former last dim of (*S) becomes the stick dim.
+    #     4. slice [0:1] on the now-non-stick axis (length 64) keeps slot 0,
+    #        the valid value.
+    #     5. squeeze the size-1 dim → (*S).
+    in_size = [int(s) for s in x.get_size()]
+    if in_size and in_size[-1] != 1:
+        # keepdim=False path.
+        expanded = _lower_reinterpret_impl(x, None)  # (*S, 64)
+        rank = len(expanded.get_size())
+        perm = list(range(rank))
+        perm[-2], perm[-1] = perm[-1], perm[-2]
+        permuted = lowering.permute(expanded, perm)  # swap last two dims
+        materialized = clone(permuted, memory_format=torch.contiguous_format)
+        sliced = lowering.slice_(materialized, dim=-2, start=0, end=1)
+        squeezed = lowering.squeeze(sliced, dim=-2)  # (*S)
+        return squeezed
+
+    # keepdim=True path: Pointwise clone of the sparse input.
     base = x
     while not isinstance(base, StorageBox):
         base = base.data
@@ -893,6 +952,13 @@ def lower_compact(x):
     )
 
     pw.realize()
+    # Tag the underlying Pointwise so _compact_layout fires only on the canonical
+    # keepdim=True compact buffer (and not on intermediate buffers in the
+    # keepdim=False reinterpret -> permute -> clone -> slice -> squeeze chain).
+    pw_node = pw
+    while hasattr(pw_node, "data") and not isinstance(pw_node, Pointwise):
+        pw_node = pw_node.data
+    _spyre_compact_keepdim_true_ids.add(id(pw_node))
     return pw
 
 

@@ -277,6 +277,29 @@ def test_compact_dense_input_no_reinterpret():
     # (This is a smoke test for the no-op path.)
 
 
+# -------- Tests: keepdim=False (3D input → 2D sparse → compact → 2D dense) --------
+#
+# All dim sizes must be multiples of 64 (stick size for fp16) due to a known
+# limitation in transpose/restickify for non-aligned sizes.
+
+
+def test_compact_keepdim_false_3d_correctness():
+    """3D sum(dim=-1, keepdim=False) → compact → add: result matches expected value."""
+
+    def fn(x):
+        y = torch.sum(x, dim=-1, keepdim=False)
+        y = torch.ops.spyre.compact(y)
+        return y + y
+
+    # (4, 128, 64): all dims divisible by 64; M=128 avoids the M==64 ambiguity
+    x = torch.ones(4, 128, 64, dtype=torch.float16)
+    x_spyre = x.to(DEVICE)
+    result = _compile_and_run(fn, [x_spyre], DEVICE).cpu()
+    # sum over 64 ones = 64.0, doubled = 128.0
+    expected = torch.full((4, 128), 128.0, dtype=torch.float16)
+    torch.testing.assert_close(result, expected, atol=0.1, rtol=0.1)
+
+
 # -------- spyre::reinterpret standalone tests --------
 
 
