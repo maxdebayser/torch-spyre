@@ -765,10 +765,10 @@ def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     Two paths, distinguished by the trailing dim of the input:
 
     keepdim=True (trailing size-1):  delegate to spyre::compact_relabel,
-        a dedicated op for the sparse → dense zero-cost relabel.  Its
-        lowering and layout handler stamp the dense default STL on the
-        output buffer, while EdgeCostMap fires REINTERPRET for the
-        sparse → dense transition (no restickify kernel).
+        a dedicated op whose layout handler stamps the dense default STL on
+        the output and accepts any input STL via AnyInNode.  The optimizer
+        inserts a sparse → dense restickify upstream when the producer is
+        sparse.
 
     keepdim=False (no trailing size-1):
         reinterpret(x)      # (*S, 64) — slot 0 of each stick is valid

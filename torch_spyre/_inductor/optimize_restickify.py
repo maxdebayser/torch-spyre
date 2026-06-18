@@ -35,32 +35,12 @@ from torch._inductor.ir import (
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
 from .pass_utils import (
-    compute_compact_dense_stl,
     compute_restickify_needed,
     device_coordinates,
     host_coordinates,
-    is_default_dim_order_sparse_stl,
 )
 
 INF = math.inf
-
-
-class _ReinterpretSentinel:
-    """Singleton sentinel stored in EdgeCostMap._layout to signal a zero-cost
-    sparse-to-dense layout reinterpret (no restickify kernel needed)."""
-
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
-    def __repr__(self):
-        return "REINTERPRET"
-
-
-REINTERPRET = _ReinterpretSentinel()
 
 logger = get_inductor_logger("optimize_restickify")
 
@@ -104,50 +84,9 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if stick-compatible or a zero-cost reinterpret is possible,
-        the input element count if restickifiable, or INF if infeasible.
-
-        Sparse → dense zero-cost REINTERPRET (in-place metadata rewrite, no
-        kernel): the producer must have the default dim_order
-        [0, 1, ..., rank-1, -1] so its byte stream walks host elements in
-        the same sequence as the default dense STL.  In-graph reductions
-        always emit default-dim_order sparse; a graph input can carry a
-        non-default dim_order via an explicit user-supplied device_layout=,
-        in which case its bytes are not byte-identical to the default dense
-        STL and we fall through to restickify (slow, correct).  Used by
-        spyre::compact (keepdim=True).
-
-        finalize_layouts/insert_restickify will rewrite the producer buffer's
-        FixedTiledLayout in place to target_stl when REINTERPRET fires.
-
-        A sparse → sparse zero-cost relabel was previously recognised here
-        for the case "two sparse STLs over the same host shape, only the
-        dim_order differs."  That relabel was unsound — the byte streams of
-        two sparse layouts with different dim_orders walk valid host
-        elements in different orders (verified empirically: relabel of
-        non-canonical sparse to canonical sparse on host [2, 128] produced
-        an interleaved tensor [0, 2, 4, ...] / [1, 3, 5, ...] instead of
-        the original row-major content).  Removed; same-host-shape sparse
-        with different dim_orders now falls through to restickify.  In
-        practice this path is unreachable from in-graph workflows because
-        reductions always emit default-dim_order sparse; only an explicit
-        user-supplied non-default device_layout= on a graph input could
-        previously have taken it.
+        Cost is 0 if stick-compatible, the input element count if
+        restickifiable, or INF if infeasible.
         """
-        # Sparse → dense zero-cost reinterpret: the input is default-dim_order
-        # sparse and the dense STL for the same host layout matches target_stl.
-        # The default-dim_order check guards against non-default-dim_order
-        # graph inputs whose bytes would not match the default dense walk.
-        dense_stl = compute_compact_dense_stl(in_stl, self._dep_layout)
-        if (
-            dense_stl is not None
-            and dense_stl == target_stl
-            and is_default_dim_order_sparse_stl(in_stl, self._dep_layout)
-        ):
-            self._cost[in_stl][target_stl] = 0.0
-            self._layout[in_stl][target_stl] = REINTERPRET
-            return
-
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
         )

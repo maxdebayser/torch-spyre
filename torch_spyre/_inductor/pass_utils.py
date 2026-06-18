@@ -721,28 +721,6 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
 
-def compute_compact_dense_stl(
-    sparse_stl: SpyreTensorLayout, host_layout: FixedLayout
-) -> "SpyreTensorLayout | None":
-    """Compute the dense STL for the same buffer described by a sparse STL.
-
-    The sparse STL and dense STL describe the same physical bytes — only the
-    device layout metadata changes. The dense STL is computed from scratch using
-    the default-layout SpyreTensorLayout constructor (no -1 in dim_order),
-    preserving element_arrangement from the sparse STL.
-
-    Returns None if sparse_stl is already the default dense layout for this
-    host shape (including degenerate cases where host dims of size 1 produce
-    STLs that are indistinguishable from sparse STLs by stride_map alone).
-    """
-    host_size = [concretize_expr(s) for s in host_layout.size]
-    dense_stl = SpyreTensorLayout(host_size, host_layout.dtype)
-    dense_stl = dense_stl.with_element_arrangement(sparse_stl.element_arrangement)
-    if sparse_stl == dense_stl:
-        return None
-    return dense_stl
-
-
 def is_sparse_stl(stl: SpyreTensorLayout) -> bool:
     """Return True if stl has the stride_map pattern of a sparse Spyre layout.
 
@@ -751,38 +729,9 @@ def is_sparse_stl(stl: SpyreTensorLayout) -> bool:
     stride_map[-1] == -1 (no corresponding host stride).
 
     Note: this predicate may return True for dense layouts whose host has all
-    size-1 dims (since size-1 dims also carry stride_map == -1).  Callers that
-    need to distinguish the two cases should use compute_compact_dense_stl
-    with the host FixedLayout, which returns None for already-dense layouts.
+    size-1 dims (since size-1 dims also carry stride_map == -1).
     """
     return int(stl.stride_map[-1]) == -1
-
-
-def is_default_dim_order_sparse_stl(
-    stl: SpyreTensorLayout, host_layout: FixedLayout
-) -> bool:
-    """Return True if stl is the sparse STL with default dim_order for host_layout.
-
-    Default dim_order is [0, 1, ..., rank-1, -1] — the dim_order that the C++
-    SpyreTensorLayout default ctor and reduction ops produce.  Producers with
-    this dim_order walk host elements in the same sequence as the default
-    dense STL, which makes a sparse-to-dense REINTERPRET safe.
-
-    A non-default-dim-order producer (only possible today via an explicit
-    user-supplied device_layout= on a graph input) walks host elements in a
-    different sequence; relabeling its bytes as dense would silently miscompile.
-    """
-    host_size = [concretize_expr(s) for s in host_layout.size]
-    host_stride = [concretize_expr(s) for s in host_layout.stride]
-    rank = len(host_size)
-    dim_order = list(range(rank)) + [-1]
-    canonical_sparse = SpyreTensorLayout(
-        host_size, host_stride, host_layout.dtype, dim_order
-    )
-    canonical_sparse = canonical_sparse.with_element_arrangement(
-        stl.element_arrangement
-    )
-    return stl == canonical_sparse
 
 
 def compute_restickify_needed(

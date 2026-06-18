@@ -20,7 +20,6 @@ import torch
 from .constants import ELIDED_COPY_BACK_ATTR
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .optimize_restickify import _ReinterpretSentinel
 from .pass_utils import copy_fx_custom_meta
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -62,74 +61,6 @@ def _record_restickify(
     restickify_plan[op.get_name()].append(
         {"arg_name": dep_name, "target_layout": target_layout}
     )
-
-
-def _record_reinterpret(
-    dep_name: str,
-    rewrite_layout: FixedTiledLayout,
-    reinterpret_plan: dict,
-) -> None:
-    """Record that the producer buffer dep_name should be reinterpreted in place
-    to rewrite_layout (no kernel, no FX node).
-
-    reinterpret_plan maps buffer name -> target FixedTiledLayout.
-    """
-    reinterpret_plan[dep_name] = rewrite_layout
-
-
-def _apply_reinterpret_on_producer(
-    dep_name: str,
-    rewrite_layout: FixedTiledLayout,
-    graph: GraphLowering,
-) -> None:
-    """Rewrite the producer buffer's FixedTiledLayout in place to rewrite_layout.
-
-    Used by the sparse → dense REINTERPRET flavour in EdgeCostMap (spyre::compact
-    and the in-graph reinterpret seam: a default-dim_order sparse producer is
-    relabeled as the matching default dense STL because their bytes are
-    byte-identical after stripping stick padding).
-
-    Preconditions (checked defensively):
-    - The buffer's current STL must differ from rewrite_layout (no-op rewrite).
-    No FX node is inserted; no OpSpec is created. The consumer kernel will read
-    the same bytes under the new STL because TensorArg is snapshotted at codegen
-    time from the buffer's current layout.
-    """
-    input_buf = graph.get_buffer(dep_name)
-    if input_buf is None:
-        logger.warning(f"reinterpret: buffer {dep_name!r} not found, skipping")
-        return
-    # Graph inputs are wrapped as TensorBox(StorageBox(InputBuffer)); TensorBox
-    # has no `layout` setter, so unwrap to the underlying InputBuffer (mirrors
-    # the unwrap in finalize_layouts above).
-    if (
-        isinstance(input_buf, TensorBox)
-        and isinstance(input_buf.data, StorageBox)
-        and isinstance(input_buf.data.data, InputBuffer)
-    ):
-        input_buf = input_buf.data.data
-    current_layout = input_buf.get_layout()
-    if isinstance(current_layout, MutationLayoutSHOULDREMOVE):
-        current_layout = current_layout.real_layout()
-    if not isinstance(current_layout, FixedTiledLayout):
-        logger.warning(
-            f"reinterpret: buffer {dep_name!r} layout is {type(current_layout).__name__}, "
-            "expected FixedTiledLayout — skipping"
-        )
-        return
-    current_stl = current_layout.device_layout
-    if current_stl == rewrite_layout.device_layout:
-        logger.warning(
-            f"reinterpret: buffer {dep_name!r} already has target STL, skipping"
-        )
-        return
-    logger.info(
-        f"Reinterpreting {dep_name!r} in place: "
-        f"{list(current_stl.device_size)} stride_map={list(current_stl.stride_map)} "
-        f"-> {list(rewrite_layout.device_layout.device_size)} "
-        f"stride_map={list(rewrite_layout.device_layout.stride_map)}"
-    )
-    input_buf.layout = rewrite_layout
 
 
 class NameSwapHandler(WrapperHandler):
@@ -268,21 +199,11 @@ def insert_restickify_on_node_inputs(
 
 
 def insert_restickify(graph: GraphLowering) -> None:
-    """Apply reinterprets and insert restickify operations from finalize_layouts plans.
+    """Insert restickify operations from the finalize_layouts plan.
 
-    Reinterprets (graph.reinterpret_plan): rewrite producer buffer layouts in place,
-    zero-cost, no FX node, no kernel.
-
-    Restickifies (graph.restickify_plan): splice ComputedBuffer nodes into the
-    operations list before their consumers.
-    No scheduler state is touched.
+    Splices ComputedBuffer restickify nodes into the operations list before
+    their consumers.  No scheduler state is touched.
     """
-    # Apply reinterprets first — these must happen before restickify insertion
-    # so that subsequent consumers see the updated layout.
-    reinterpret_plan = getattr(graph, "reinterpret_plan", {})
-    for dep_name, rewrite_layout in reinterpret_plan.items():
-        _apply_reinterpret_on_producer(dep_name, rewrite_layout, graph)
-
     operations = graph.operations
     restickify_plan = graph.restickify_plan
     if not restickify_plan:
@@ -326,7 +247,6 @@ def finalize_layouts(graph: GraphLowering) -> None:
             del tensor_box.layouts
 
     plan: dict = defaultdict(list)
-    reinterpret_plan: dict = {}
 
     for op in operations:
         cost_fn = getattr(op, "restick_cost_fn", None)
@@ -343,8 +263,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
             stl = committed if cost_fn else op_layouts[0]
             op.layout = _fixed_tiled(op.layout, stl)
 
-        # For each input edge, schedule a restickify or reinterpret if the input's
-        # committed STL is incompatible with what this op requires on that edge.
+        # For each input edge, schedule a restickify if the input's committed
+        # STL is incompatible with what this op requires on that edge.
         if not cost_fn:
             continue
         for edge, target_stl in cost_fn.required_input_stls(committed):
@@ -359,29 +279,14 @@ def finalize_layouts(graph: GraphLowering) -> None:
             result = edge.layout(in_stl, target_stl)
             if result is None:
                 continue
-            if isinstance(result, _ReinterpretSentinel):
-                # REINTERPRET fires for sparse → dense same host shape
-                # (spyre::compact).  The producer's default-dim_order sparse
-                # bytes are identical to the matching dense STL — the rewrite
-                # target is exactly target_stl, no recomputation needed.  We
-                # just rewrite the producer's FixedTiledLayout in place.
-                rewrite_target = _fixed_tiled(in_layout, target_stl)
-                logger.info(
-                    f"Scheduling reinterpret on {edge.dep.name}: "
-                    f"{list(in_stl.device_size)} stride_map={list(in_stl.stride_map)} "
-                    f"-> {list(target_stl.device_size)} stride_map={list(target_stl.stride_map)}"
-                )
-                _record_reinterpret(edge.dep.name, rewrite_target, reinterpret_plan)
-            else:
-                restick_target = _fixed_tiled(in_layout, result)
-                logger.info(
-                    f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
-                    f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
-                )
-                _record_restickify(op, edge.dep.name, restick_target, plan)
+            restick_target = _fixed_tiled(in_layout, result)
+            logger.info(
+                f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
+                f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"
+            )
+            _record_restickify(op, edge.dep.name, restick_target, plan)
 
     V.graph.restickify_plan = plan
-    V.graph.reinterpret_plan = reinterpret_plan
     if logger.isEnabledFor(logging.DEBUG):
         if plan:
             lines = ["restickify plan:"]

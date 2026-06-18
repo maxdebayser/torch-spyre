@@ -790,28 +790,18 @@ def _compact_relabel_layout(
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
-    """Layout for spyre::compact_relabel (sparse → dense zero-cost relabel).
+    """Layout for spyre::compact_relabel: output is the default dense STL.
 
-    compact_relabel converts a sparse layout to dense via a zero-cost
-    in-place reinterpretation of the producer buffer.  The output is always
-    the default dense STL for the output host shape; the input is required
-    to present that same dense STL (which costs 0 when the input is sparse
-    — the REINTERPRET sentinel fires in EdgeCostMap._compute_and_cache_cost).
-
-    This cannot fall through to the default single-arg Pointwise handler:
-    that handler tries to preserve the input's stick expression, which
-    would propagate a sparse input STL forward and leave the output sparse
-    — defeating compact_relabel's purpose.  AnyInNode is also wrong here
-    (it's for clone, which absorbs layout mismatches as a restickify);
-    compact_relabel emits a real identity OpSpec, so the zero-cost
-    REINTERPRET edge has to be what bridges sparse → dense.
+    Input may be sparse or dense; AnyInNode lets the optimizer schedule a
+    restickify when the input STL doesn't match the output dense STL.
+    This is the same pattern used by clone for layout transitions.
     """
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(
         c_size, c_stride, output.dtype, list(range(len(output.size)))
     )
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [out_stl], op)
+    op.restick_cost_fn = AnyInNode.from_args()
     return [out_stl]
 
 

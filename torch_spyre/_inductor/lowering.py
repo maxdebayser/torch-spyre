@@ -867,13 +867,11 @@ def lower_reinterpret(x):
 
 @register_spyre_lowering(torch.ops.spyre.compact_relabel)
 def lower_compact_relabel(x):
-    # spyre::compact_relabel: sparse (*S, 1) → dense (*S, 1) zero-cost layout
-    # relabel.  Emitted by the compact decomposition for the keepdim=True
-    # case.  The output is a Pointwise clone of the sparse input;
-    # _compact_relabel_layout (in propagate_layouts) assigns the dense
-    # default STL, FixedInOutNode requires the input to match, and
-    # EdgeCostMap fires REINTERPRET for the sparse → dense transition (no
-    # restickify kernel).
+    # spyre::compact_relabel: sparse (*S, 1) → dense (*S, 1).  Emitted by the
+    # compact decomposition for the keepdim=True case.  The output is a
+    # Pointwise clone of the input; _compact_relabel_layout (in
+    # propagate_layouts) assigns the dense default STL with AnyInNode, and the
+    # optimizer inserts a restickify upstream if the producer's STL is sparse.
     #
     # The keepdim=False path of compact is handled entirely by the
     # decomposition (reinterpret → permute → clone → slice → squeeze → mul);
