@@ -68,7 +68,6 @@ def spyre_hint(**kwargs: Any):
 
 
 def _reset_counter(*args, **kwargs):
-    print("reset counter")
     global _hint_counter
     _hint_counter = 0
 
