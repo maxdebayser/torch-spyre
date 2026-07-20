@@ -25,6 +25,7 @@ import torch.compiler
 import torch.fx.traceback
 from torch._dynamo.symbolic_convert import InstructionTranslator
 from torch.fx.passes.graph_transform_observer import GraphTransformObserver
+import torch._inductor.fx_passes.post_grad
 from torch._inductor.ir import Operation
 
 from .logging_utils import get_inductor_logger
@@ -80,7 +81,7 @@ def get_id():
     setattr(tx, "__spyre_hint_counter", counter + 1)
 
     # returning a tensor is required for allow_in_graph
-    return counter, torch.zeros(0, device="cpu")
+    return counter, torch.empty(0, device="cpu")
 
 
 def spyre_hint(**kwargs: Any):
@@ -156,12 +157,17 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
 
         graph.owning_module.meta[META_KEY] = {"apply_graph_pass": _original}
 
-        # # disable addmm fusion. The fusion will be undone by the decomposition that is
-        # # registered in torch-spyre, but the hints are lost in the process
-        # for entries in torch._inductor.fx_passes.post_grad.pass_patterns[2].patterns.values():
-        #     for entry in entries:
-        #         if entry.extra_check == torch._inductor.fx_passes.post_grad.is_valid_addmm_fusion:
-        #             entry.extra_check = lambda x: False
+        # disable addmm fusion. The fusion will be undone by the decomposition that is
+        # registered in torch-spyre, but the hints are lost in the process
+        for entries in torch._inductor.fx_passes.post_grad.pass_patterns[
+            2
+        ].patterns.values():
+            for entry in entries:
+                if (
+                    entry.extra_check
+                    == torch._inductor.fx_passes.post_grad.is_valid_addmm_fusion
+                ):
+                    entry.extra_check = lambda x: False
 
         @wraps(GraphTransformObserver.apply_graph_pass)
         def apply_graph_pass(self, pass_fn):
