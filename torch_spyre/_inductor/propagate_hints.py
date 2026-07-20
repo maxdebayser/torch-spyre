@@ -88,7 +88,10 @@ def spyre_hint(**kwargs: Any):
     """
     Attach a hint and a unique hint id to every FX node in scope.
     """
-    _id, _ = get_id()
+    if torch.compiler.is_compiling():
+        _id, _ = get_id()
+    else:
+        _id = 0
     return torch.fx.traceback.annotate({f"_hint_{_id}": kwargs})
 
 
