@@ -386,7 +386,6 @@ class TestNamedWorkDivisionHint(InductorTestCase):
     @config.patch(
         {
             "bundle_symbolic_args": True,
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
             "sencores": 8,
@@ -415,7 +414,6 @@ class TestNamedWorkDivisionHint(InductorTestCase):
     @config.patch(
         {
             "bundle_symbolic_args": True,
-            "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
             "sencores": 8,
