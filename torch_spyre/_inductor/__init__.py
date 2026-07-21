@@ -19,7 +19,7 @@ from . import config
 import threading
 from functools import wraps
 
-from .propagate_hints import spyre_hint, get_op_hints, _reset_counter  # noqa: F401
+from .propagate_hints import spyre_hint, get_op_hints  # noqa: F401
 from torch_spyre.profiler._ffdc import CATEGORY_COMPILE, try_collect
 
 _autoload_lock = threading.Lock()
