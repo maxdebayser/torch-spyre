@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import contextmanager
 from .constants import DEVICE_NAME
 from .patches import enable_spyre_context
 from . import config
@@ -129,7 +128,6 @@ def enable_spyre_compile_fx_wrapper():
                 if uses_spyre:
                     try_collect(exc, logger=logger, failure_category=CATEGORY_COMPILE)
                 raise
-
 
         cfx.compile_fx = _wrapper
         cfx._spyre_wrapped = True
