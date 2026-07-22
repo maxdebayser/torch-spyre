@@ -813,9 +813,11 @@ class SpyreKernel(Kernel[CSEVariable]):
                 # wrong output coords.  Replace only the output TensorArg.
                 try:
                     it_sp = iteration_space(self.current_node)
-                    out_arg = _build_reinterpret_out_arg(dst, it_sp)
                     existing_spec = self.op_specs[-1]
                     assert isinstance(existing_spec, OpSpec)
+                    out_arg = _build_reinterpret_out_arg(
+                        existing_spec.args[-1], dst, it_sp
+                    )
                     new_spec = OpSpec(
                         op=IDENTITY_OP,
                         is_reduction=False,
@@ -887,7 +889,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                     wd = apply_splits_from_index_coeff(
                         ir_node.op_it_space_splits, wi, ri, it_sp
                     )
-                reinterp_spec = _build_reinterpret_opspec(value, dst, it_sp, wd)
+                reinterp_spec = _build_reinterpret_opspec(
+                    op_spec.args[-2], op_spec.args[-1], value, dst, it_sp, wd
+                )
                 self.op_specs[-1] = reinterp_spec
                 logger.debug(
                     f"reinterpret: replaced OpSpec for {name!r} with hand-crafted identity, "
@@ -1131,6 +1135,7 @@ def _reinterpret_coords(
 
 
 def _build_reinterpret_out_arg(
+    template: "TensorArg",
     expanded_output: "TensorAccess",
     it_space: "dict[sympy.Symbol, sympy.Expr]",
 ) -> "TensorArg":
@@ -1141,27 +1146,26 @@ def _build_reinterpret_out_arg(
     compute_coordinates produce wrong coords.  We bypass it by deriving
     iteration-symbol → host-stride from the index expression in
     _reinterpret_coords, then matching device dims by stride_map.
+
+    ``template`` is the auto-generated (registered) output TensorArg; we mutate
+    it in place so that ``arg_index`` / ``allocation`` stay intact -- the arg is
+    the same object held by ``spyre_kernel_args``, so its ``arg_index`` is still
+    resolved by the later fix-up loop.  We override only the coordinates that
+    compute_coordinates got wrong.
     """
-    out_layout = expanded_output.layout
-    out_stl = out_layout.device_layout
-    out_coords = _reinterpret_coords(
+    out_stl = expanded_output.layout.device_layout
+    template.device_coordinates = _reinterpret_coords(
         [int(s) for s in out_stl.device_size],
         [int(s) for s in out_stl.stride_map],
         expanded_output.index,
         it_space,
     )
-    return TensorArg(
-        is_input=False,
-        arg_index=-1,
-        device_dtype=out_stl.device_dtype,
-        device_size=list(out_stl.device_size),
-        device_coordinates=out_coords,
-        allocation=out_layout.allocation,
-        per_tile_fixed=getattr(out_layout, "per_tile_fixed", False),
-    )
+    return template
 
 
 def _build_reinterpret_opspec(
+    template_in: "TensorArg",
+    template_out: "TensorArg",
     sparse_input: "TensorAccess",
     expanded_output: "TensorAccess",
     it_space: "dict[sympy.Symbol, sympy.Expr]",
@@ -1177,44 +1181,32 @@ def _build_reinterpret_opspec(
     by matching each iteration symbol's coefficient in the index expression
     (its host stride) to the tensor's stride_map.
 
+    ``template_in`` / ``template_out`` are the auto-generated (registered)
+    TensorArgs; we mutate them in place so ``arg_index`` / ``allocation`` stay
+    intact -- they are the same objects held by ``spyre_kernel_args``, so their
+    ``arg_index`` is still resolved by the later fix-up loop.  We override only
+    the coordinates compute_coordinates got wrong.
+
     Iteration space has (host_rank + 1) symbols: host dims + the stick symbol.
     """
-    in_layout = sparse_input.layout
-    in_stl = in_layout.device_layout
-    out_layout = expanded_output.layout
-    out_stl = out_layout.device_layout
+    in_stl = sparse_input.layout.device_layout
+    out_stl = expanded_output.layout.device_layout
 
-    in_coords = _reinterpret_coords(
+    template_in.device_coordinates = _reinterpret_coords(
         [int(s) for s in in_stl.device_size],
         [int(s) for s in in_stl.stride_map],
         sparse_input.index,
         it_space,
     )
-    out_coords = _reinterpret_coords(
+    template_out.device_coordinates = _reinterpret_coords(
         [int(s) for s in out_stl.device_size],
         [int(s) for s in out_stl.stride_map],
         expanded_output.index,
         it_space,
     )
 
-    in_arg = TensorArg(
-        is_input=True,
-        arg_index=-1,
-        device_dtype=in_stl.device_dtype,
-        device_size=list(in_stl.device_size),
-        device_coordinates=in_coords,
-        allocation=in_layout.allocation,
-        per_tile_fixed=getattr(in_layout, "per_tile_fixed", False),
-    )
-    out_arg = TensorArg(
-        is_input=False,
-        arg_index=-1,
-        device_dtype=out_stl.device_dtype,
-        device_size=list(out_stl.device_size),
-        device_coordinates=out_coords,
-        allocation=out_layout.allocation,
-        per_tile_fixed=getattr(out_layout, "per_tile_fixed", False),
-    )
+    in_arg = template_in
+    out_arg = template_out
 
     wd = work_division or {}
     it_space_extended = {k: (v, wd.get(k, 1)) for k, v in it_space.items()}
