@@ -24,11 +24,11 @@ from torch._inductor.virtualized import V
 from .constants import SEGMENT_SIZE, INTERMEDIATES_SEGMENT
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .scheduler import CountedLoopSchedulerNode
-from .logging_utils import get_inductor_logger, _get_env_bool
+from .logging_utils import get_inductor_logger
+from . import config
 
 logger = get_inductor_logger("MEMORY_PLANNING")
 _STICK_BYTES = 128
-_MEMORY_PLAN_ENABLED = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
 
 
 class Allocator:
@@ -97,7 +97,7 @@ def _align_up(n: int, alignment: int) -> int:
 def _compute_size_bytes(name: str) -> int:
     """Return the stick-aligned device size in bytes for buffer `name`."""
     buf = V.graph.get_buffer(name)
-    layout = buf.get_layout()
+    layout = buf.maybe_get_layout()
     assert isinstance(layout, FixedTiledLayout), (
         f"memory_planning: expected FixedTiledLayout for {name}, got {type(layout)}"
     )
@@ -148,7 +148,7 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     Graph inputs/outputs and LX-allocated buffers are excluded.
     """
 
-    if not _MEMORY_PLAN_ENABLED:
+    if not config.hbm_planning:
         V.graph.pool_size = 0
         return nodes
 
@@ -209,22 +209,34 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         for io_name in io_names
         if (io_buf := V.graph.get_buffer(io_name)) is not None
         and not isinstance(io_buf, Symbol)
-        and isinstance(layout := io_buf.get_layout(), FixedTiledLayout)
+        # Use maybe_get_layout(): None-valued args carried by FallbackKernels
+        # have no layout and raise from get_layout().
+        and isinstance(layout := io_buf.maybe_get_layout(), FixedTiledLayout)
     }
 
     def _is_intermediate(name: str) -> bool:
         buf = V.graph.get_buffer(name)
         if buf is None:
             return False
-        layout = buf.get_layout()
+        layout = buf.maybe_get_layout()
         return (
             isinstance(layout, FixedTiledLayout)
             and "lx" not in layout.allocation
             and id(layout.allocation) not in io_alloc_ids
         )
 
+    # Buffers read by Fallback/Extern/Nop nodes must stay Python-side tensors.
+    fallback_read = {
+        dep.name
+        for node in flat_nodes
+        if isinstance(node, _kernel_arg_types)
+        for dep in node.read_writes.reads
+    }
+
     intermediates = {
-        name for name in (written & read) - io_names if _is_intermediate(name)
+        name
+        for name in (written & read) - io_names - fallback_read
+        if _is_intermediate(name)
     }
     if not intermediates:
         V.graph.pool_size = 0
@@ -233,7 +245,12 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     live_ranges = _compute_live_ranges(nodes, intermediates)
 
     # Sort by start step so the allocator processes tensors in execution order.
-    sorted_bufs = sorted(live_ranges.items(), key=lambda kv: kv[1][0])
+    # Tie-break on (end_step, name) for determinism:
+    def _alloc_sort_key(item: tuple[str, tuple[int, int]]) -> tuple[int, int, str]:
+        name, (start, end) = item
+        return (start, end, name)
+
+    sorted_bufs = sorted(live_ranges.items(), key=_alloc_sort_key)
 
     allocator = Allocator(SEGMENT_SIZE)
 
@@ -254,11 +271,14 @@ def memory_planning(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         size = _compute_size_bytes(name)
         offset = allocator.allocate(size)
 
-        # Assign HBM address directly to layout.allocation.
+        # Assign pool offset directly to layout.allocation.
         buf = V.graph.get_buffer(name)
-        layout = buf.get_layout()
+        layout = buf.maybe_get_layout()
         assert isinstance(layout, FixedTiledLayout)
-        layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
+        if config.bundle_symbolic_args:
+            layout.allocation["pool"] = offset
+        else:
+            layout.allocation["pool"] = INTERMEDIATES_SEGMENT + offset
 
         pending_frees.append((end, offset, size))
 

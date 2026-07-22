@@ -244,7 +244,7 @@ def _stick_incompatibility_reason(
 
 
 def _fmt_buf(layout: Any, dep: "MemoryDep") -> str:
-    h_coords = host_coordinates(layout, dep)
+    h_coords = host_coordinates(layout, dep, None)
     return (
         f"size={list(layout.size)}  stride={list(layout.stride)}  h_coords={h_coords}"
     )
@@ -274,13 +274,15 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
         lines.append(f"    {ec.dep.name}:  {_fmt_buf(host_layout, ec.dep)}")
         for j, stl in enumerate(ec._in_layouts):
             lines.append(
-                f"      STL {j}:  {_fmt_stl(device_coordinates(stl, ec.dep), stl)}"
+                f"      STL {j}:  {_fmt_stl(device_coordinates(stl, ec.dep, None), stl)}"
             )
         lines.append("")
 
     lines.append(f"  Output:  {_fmt_buf(out_layout, out_dep)}")
     for i, stl in enumerate(op.layouts):
-        lines.append(f"    STL {i}:  {_fmt_stl(device_coordinates(stl, out_dep), stl)}")
+        lines.append(
+            f"    STL {i}:  {_fmt_stl(device_coordinates(stl, out_dep, None), stl)}"
+        )
 
     analysis = []
     for i, candidate_stl in enumerate(op.layouts):
@@ -288,10 +290,10 @@ def _no_feasible_layout_error(op) -> NotImplementedError:
         if blocking_ec is None:
             analysis.append(f"    STL {i}: no blocking input identified")
         else:
-            out_stick = device_coordinates(candidate_stl, out_dep)[-1]
+            out_stick = device_coordinates(candidate_stl, out_dep, None)[-1]
             for j, in_stl in enumerate(blocking_ec._in_layouts):
                 if blocking_ec.cost(in_stl, candidate_stl) == INF:
-                    in_stick = device_coordinates(in_stl, blocking_ec.dep)[-1]
+                    in_stick = device_coordinates(in_stl, blocking_ec.dep, None)[-1]
                     reason = _stick_incompatibility_reason(in_stick, out_stick)
                     reason_str = f": {reason}" if reason else ""
                     analysis.append(
@@ -391,7 +393,8 @@ class BeamState:
     cost: float
 
 
-BEAM_WIDTH = 64
+BEAM_WIDTH = 200
+MAX_BEAM_STATES_LOGGED = 10
 
 
 class Frontier:
@@ -489,10 +492,13 @@ def beam_global_min_cost(operations: list) -> None:
         max_states = max(max_states, len(frontier.states))
         if logger.isEnabledFor(logging.DEBUG):
             lines = [f"beam after {op.get_name()} [{len(frontier.states)} states]:"]
-            for i, s in enumerate(frontier.states):
+            for i, s in enumerate(frontier.states[:MAX_BEAM_STATES_LOGGED]):
                 lines.append(f"  state {i} (cost={s.cost}):")
                 for name, stl in zip(frontier.buf_names, s.assignments):
                     lines.append(f"    {name}: stride_map={list(stl.stride_map)}")
+            extra = len(frontier.states) - MAX_BEAM_STATES_LOGGED
+            if extra > 0:
+                lines.append(f"    ... {extra} additional states not logged")
             logger.debug("\n".join(lines))
 
     logger.info(

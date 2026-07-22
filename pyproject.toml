@@ -33,7 +33,10 @@ requires-python = ">=3.11"
 dynamic = ["version"]
 
 [project.optional-dependencies]
-build = [ # no-isolation build 
+cpsat = [ # OR-Tools CP-SAT LX layout solver (layout_solver='cpsat' / LAYOUT_SOLVER=cpsat)
+    "ortools>=9.0",
+]
+build = [ # no-isolation build
     # any change here should be reflected in the build system above
     "build",  # only required to build torch_sendnn
     "cmake>=3.27,<4.0.0",
@@ -53,7 +56,6 @@ test = [
     "pydantic",             # needed by test framework to support pydantic models for config
     "pytest-xdist",         # -n1 worker isolation for segfault resilience
 #    "torch_sendnn",        # must be installed manually
-    "transformers~=4.57.1"
 ]
 lint = [
     "mypy~=1.13.0",
