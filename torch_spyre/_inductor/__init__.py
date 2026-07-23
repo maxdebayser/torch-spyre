@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .constants import DEVICE_NAME
-from .patches import enable_spyre_context
+from .patches import enable_spyre_context, patch_inductor_fusions
 from . import config
 
 import threading
@@ -35,6 +35,9 @@ def enable_spyre_compile_fx_wrapper():
     with _autoload_lock:
         if getattr(cfx, "_spyre_wrapped", False):
             return
+
+        patch_inductor_fusions()
+
         _orig = cfx.compile_fx
         from torch_spyre._inductor.logging_utils import get_inductor_logger
 

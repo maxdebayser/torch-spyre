@@ -14,7 +14,6 @@
 
 
 import dataclasses
-from functools import wraps
 from typing import Any
 
 import regex as re
@@ -24,11 +23,10 @@ import torch
 import torch.compiler
 import torch.fx.traceback
 from torch._dynamo.symbolic_convert import InstructionTranslator
-from torch.fx.passes.graph_transform_observer import GraphTransformObserver
-import torch._inductor.fx_passes.post_grad
 from torch._inductor.ir import Operation
 
 from .logging_utils import get_inductor_logger
+from .patches import OBSERVER_HOOKS_KEY
 
 logger = get_inductor_logger("propagate_hints")
 
@@ -116,13 +114,10 @@ def get_op_hints(op: Operation) -> dict[int, dict[str, Any]]:
     return hints
 
 
-META_KEY = "__spyre_post_grad_hooks_meta"
-
-
 def log_new_nodes(node: torch.fx.Node):
     if (
         node.graph.owning_module is not None
-        and (meta := node.graph.owning_module.meta.get(META_KEY)) is not None
+        and (meta := node.graph.owning_module.meta.get(OBSERVER_HOOKS_KEY)) is not None
     ):
         _pass = meta["pass"]
         subsystem = meta["subsystem"]
@@ -154,36 +149,8 @@ def collect_spyre_hints(graph: torch.fx.Graph) -> None:
     assert graph.owning_module is not None
 
     # post_grad_custom_pre_pass is called twice
-    if graph.owning_module.meta.get(META_KEY) is None:
+    if graph.owning_module.meta.get("__spyre_dim_hints") is None:
         graph.owning_module._register_create_node_hook(log_new_nodes)
-        _original = GraphTransformObserver.apply_graph_pass
-
-        graph.owning_module.meta[META_KEY] = {"apply_graph_pass": _original}
-
-        # disable addmm fusion. The fusion will be undone by the decomposition that is
-        # registered in torch-spyre, but the hints are lost in the process
-        for entries in torch._inductor.fx_passes.post_grad.pass_patterns[
-            2
-        ].patterns.values():
-            for entry in entries:
-                if (
-                    entry.extra_check
-                    == torch._inductor.fx_passes.post_grad.is_valid_addmm_fusion
-                ):
-                    entry.extra_check = lambda x: False
-
-        @wraps(GraphTransformObserver.apply_graph_pass)
-        def apply_graph_pass(self, pass_fn):
-            meta = self.gm.meta[META_KEY]
-            meta["pass"] = self.passname
-            meta["subsystem"] = self.subsystem
-            try:
-                return _original(self, pass_fn)
-            finally:
-                meta.pop("pass", None)
-                meta.pop("subsystem", None)
-
-        GraphTransformObserver.apply_graph_pass = apply_graph_pass
 
         graph.owning_module.meta["__spyre_dim_hints"] = [
             (node.target, node.meta.get("custom"))
@@ -210,8 +177,6 @@ def recover_spyre_hints(graph: torch.fx.Graph) -> None:
     assert graph.owning_module is not None
 
     graph.owning_module._unregister_create_node_hook(log_new_nodes)
-    meta = graph.owning_module.meta.pop(META_KEY)
-    GraphTransformObserver.apply_graph_pass = meta["apply_graph_pass"]
 
     _dim_hints = graph.owning_module.meta.pop("__spyre_dim_hints")
     nodes = [n for n in graph.nodes if n.op == "call_function"]
