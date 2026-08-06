@@ -282,6 +282,30 @@ def spyre_sign(input: torch.Tensor) -> torch.Tensor:
     return (pos - neg).to(orig_dtype)
 
 
+@register_spyre_decompositions([torch.ops.aten.signbit.default])
+def spyre_signbit(input: torch.Tensor) -> torch.Tensor:
+    """Implements signbit without support for -0.0.
+
+    Without bitwise operations, the sign of -0.0 can be
+    detected on cpu with torch.reciprocal(-0.0) because it
+    returns -inf and -inf < 0.0 is True. But on sypre it just
+    returns inf.
+    """
+
+    if input.dtype.is_complex:
+        raise NotImplementedError("signbit is not supported for complex inputs")
+
+    if not input.dtype.is_floating_point:
+        # Spyre backend does not support bool result from int32 operands
+        input = input.to(torch.float16)
+
+    zeros = torch.zeros_like(input)
+    result = torch.lt(input, zeros)
+    if input.dtype == torch.float32:
+        return result.to(torch.float32).to(torch.int32).to(torch.bool)
+    return result
+
+
 @register_spyre_decompositions([torch.ops.aten.trunc.default])
 def spyre_trunc(input: torch.Tensor) -> torch.Tensor:
     if input.dtype.is_complex:
@@ -913,3 +937,21 @@ def spyre_div_Tensor_mode(
         else:
             result = result.to(a.dtype)
     return result
+
+
+@register_spyre_decompositions([torch.ops.aten.fmod.Tensor])
+def spyre_fmod(
+    a: TensorLikeType | NumberType, b: TensorLikeType | NumberType
+) -> torch.Tensor:
+    # Wrap scalars because some references only accept tensor arguments.
+    if isinstance(a, Number) and isinstance(b, Number):
+        raise TypeError("Should be unreachable")
+    elif isinstance(b, Number) and isinstance(a, torch.Tensor):
+        b = scalar_tensor(b, dtype=a.dtype, device=a.device)
+    elif isinstance(a, Number) and isinstance(b, torch.Tensor):
+        a = scalar_tensor(a, dtype=b.dtype, device=b.device)
+
+    abs_a = torch.abs(a)
+    abs_b = torch.abs(b)
+
+    return torch.sign(a) * (abs_a - torch.floor(abs_a / abs_b) * abs_b)
