@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import math
 import pytest
 import unittest
@@ -41,14 +42,17 @@ POINTWISE_UNARY_OPS_DICT = {
     "reciprocal": torch.reciprocal,
     "relu": torch.relu,
     "sign": torch.sign,
+    "signbit": torch.signbit,
     "silu": torch.ops.aten.silu,
     "sin": torch.sin,
     "tanh": torch.tanh,
+    "trunc": torch.trunc,
 }
 
 POINTWISE_UNARY_OPS_FP32_DICT = {
     "ceil": torch.ceil,
     "floor": torch.floor,
+    "trunc": torch.trunc,
 }
 
 POINTWISE_BINARY_OPS_DICT = {
@@ -655,6 +659,63 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((2880,), (1, 11, 2880)),
                 ]
             ),
+        },
+        (
+            "test_division_fp16",
+            "test_division_op",
+        ): {
+            "ops_dict": {
+                "floordiv": functools.partial(torch.div, rounding_mode="floor"),
+                "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
+                "fmod": torch.fmod,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),) * 2,
+                    ((67, 256),) * 2,
+                    ((67, 71, 256),) * 2,
+                    ((7, 12, 32, 64),) * 2,
+                    # broadcasting case
+                    ((2880,), (1, 11, 2880)),
+                ]
+            ),
+        },
+        (
+            "test_division_fp32",
+            "test_division_op",
+        ): {
+            "ops_dict": {
+                "floordiv": functools.partial(torch.div, rounding_mode="floor"),
+                "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
+                "fmod": torch.fmod,
+            },
+            "param_sets": make_param_dict(
+                [
+                    ((256,),) * 2,
+                    ((67, 256),) * 2,
+                    ((67, 71, 256),) * 2,
+                    ((7, 12, 32, 64),) * 2,
+                    # broadcasting case
+                    ((2880,), (1, 11, 2880)),
+                ],
+                dtype=torch.float32,
+            ),
+        },
+        (
+            "test_division_int64",
+            "test_division_op",
+        ): {
+            "ops_dict": {
+                "floordiv": functools.partial(torch.div, rounding_mode="floor"),
+                "truncdiv": functools.partial(torch.div, rounding_mode="trunc"),
+                "fmod": torch.fmod,
+            },
+            "param_sets": {
+                "1d": (
+                    torch.randint(-100, 100, (256,), dtype=torch.int64),
+                    torch.randint(-100, 100, (256,), dtype=torch.int64),
+                ),
+            },
         },
         (
             "test_pointwise_binary_op_int64",
@@ -6750,6 +6811,38 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.prod(a, dim=dim, keepdim=keepdim)
 
         self.compare_with_cpu(fn, x, run_eager=False)
+
+    def test_division_op(self, op, a, b):
+        """Test truncdiv, floordiv and fmod.
+
+        All three do computations on the result of div. With fp16, the
+        results can be slightly different on CPU and Spyre, but since
+        floor and trunc introduce discontinuities, this can lead to
+        results that are quite different, so this function tries to
+        massage the input data to avoid these situations. Otherwise
+        this function is basically the same as test_binary_op
+        """
+
+        abs_a = torch.abs(a)
+        abs_b = torch.abs(b)
+        # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
+        tiny_value_mask = abs_b < FP16_EPS
+        b[tiny_value_mask] = FP16_EPS
+
+        # With a small remainder floor division for negative numbers can be off by one.
+        # With float16, 0.8965/-0.4480 will be exactly -2.0 on Spyre and -2.002 on CPU.
+        tiny_remainder_mask = torch.abs(torch.fmod(a, b)) < FP16_EPS
+        a[tiny_remainder_mask] += 0.1
+
+        div_ = torch.div(abs_a, abs_b)
+        nearest_int = torch.round(div_)
+
+        # if the division is almost exact the result can
+        # be off by b, just skip these cases for now
+        almost_exact_div_mask = abs(div_ - nearest_int) < FP16_EPS
+        a[almost_exact_div_mask] = 0
+
+        self.compare_with_cpu(op, a, b)
 
 
 if __name__ == "__main__":
