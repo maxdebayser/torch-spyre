@@ -951,16 +951,5 @@ def spyre_fmod(
     elif isinstance(a, Number) and isinstance(b, torch.Tensor):
         a = scalar_tensor(a, dtype=b.dtype, device=b.device)
 
-    abs_a = torch.abs(a)
-    abs_b = torch.abs(b)
-
-    r = abs_a - torch.floor(abs_a / abs_b) * abs_b
-
-    if r.dtype == torch.float16:
-        # Low-precision division can push abs_a / abs_b just below an integer
-        # boundary, making floor() undershoot by one. Correct the remainder
-        # directly instead of tuning an epsilon on the division: if it landed
-        # in [abs_b, 2*abs_b) it's off by exactly one abs_b.
-        r = torch.where(r >= abs_b, r - abs_b, r)
-
-    return torch.sign(a) * r
+    div_ = a / b
+    return a - torch.sign(div_) * torch.floor(torch.abs(div_)) * b

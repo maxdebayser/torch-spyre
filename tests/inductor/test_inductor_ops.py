@@ -4807,7 +4807,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
             tiny_value_mask = torch.abs(x) < FP16_EPS
             x[tiny_value_mask] = FP16_EPS
-        elif op == torch.floor:
+        elif op in [torch.floor, torch.trunc]:
             # To avoid cpu mismatch due to a negative fp16 having a fraction 0b0000000001
             x = x.to("spyre").cpu()
 
@@ -6822,25 +6822,42 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         massage the input data to avoid these situations. Otherwise
         this function is basically the same as test_binary_op
         """
+        dtype = a.dtype
+        if b.dtype.is_floating_point:
+            dtype = b.dtype
 
-        abs_a = torch.abs(a)
-        abs_b = torch.abs(b)
+        if dtype.is_floating_point:
+            # To avoid cpu mismatch due to a negative
+            # fp16 having a fraction 0b0000000001
+            a = a.to(dtype).to("spyre").cpu()
+            b = a.to(dtype).to("spyre").cpu()
+
         # TODO: Division by 0 or near-zero differs on Spyre from CPU, sidestep for now.
-        tiny_value_mask = abs_b < FP16_EPS
-        b[tiny_value_mask] = FP16_EPS
+        tiny_value_mask = torch.abs(b) < FP16_EPS
+        if b.dtype.is_floating_point:
+            b[tiny_value_mask] = FP16_EPS
+        else:
+            b[tiny_value_mask] = 1
 
-        # With a small remainder floor division for negative numbers can be off by one.
-        # With float16, 0.8965/-0.4480 will be exactly -2.0 on Spyre and -2.002 on CPU.
-        tiny_remainder_mask = torch.abs(torch.fmod(a, b)) < FP16_EPS
-        a[tiny_remainder_mask] += 0.1
+        def debroadcast_mask(big, small):
+            return big.to(torch.int32).sum_to_size(small.shape).to(torch.bool)
 
-        div_ = torch.div(abs_a, abs_b)
+        # If the division is almost exact the result of the division
+        # could be slightly below an integer on spyre and above on CPU.
+        # Applying trunc or floor in these cases will create a significant
+        # difference in outputs. It also applies to integer because internally
+        # they are converted float32 and interesting things can happen:
+        # >>> a = torch.tensor(47,dtype=torch.float32,device="spyre")
+        # >>> torch.floor(a/a)
+        # >>> tensor(0., device='spyre:0')
+        # >>>
+        # >>> a = torch.tensor(47,dtype=torch.float16,device="spyre")
+        # >>> torch.floor(a/a)
+        # >>> tensor(1., dtype=torch.float16, device='spyre:0')
+        div_ = torch.div(a, b)
         nearest_int = torch.round(div_)
-
-        # if the division is almost exact the result can
-        # be off by b, just skip these cases for now
         almost_exact_div_mask = abs(div_ - nearest_int) < FP16_EPS
-        a[almost_exact_div_mask] = 0
+        a[debroadcast_mask(almost_exact_div_mask, a)] = 0
 
         self.compare_with_cpu(op, a, b)
 
