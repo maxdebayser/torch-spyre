@@ -1,9 +1,17 @@
 name: integration-tests
+run-name: integration-tests (${{ inputs.test_type || 'device_critical' }})
+# NOTE: run-name intentionally shows the RAW, user-facing input (before
+# filter_configs.py resolves unit/integration/regression to core/device_critical/
+# full) -- this is also what push-to-clickhouse.yaml's trigger_type ends up
+# recording, so ClickHouse sees the tier name callers actually asked for.
 
 # ---------------------------------------------------------------------------
 # Triggered by commits in upstream dependant repos (deeptools, flex, etc.) via
-# workflow_dispatch.  Runs the full test matrix against a specified
-# torch-spyre ref so regressions from upstream changes are caught early.
+# workflow_dispatch.  Runs the device_critical test subset (streams, job
+# launch plans, codegen, LX/scratchpad planning, tensor layout, allocator/GC,
+# D2D copies -- the device-layer surfaces these upstream tools exercise
+# most) against a specified torch-spyre ref so regressions from upstream
+# changes are caught early. Pass test_type=full for full coverage.
 #
 # Example caller pattern from an upstream repo's workflow:
 #
@@ -70,11 +78,19 @@ on:
         default: ''
       test_type:
         description: >-
-          Suite subset to run: smoke | core | full | suite_<group> | <label>.
-          Default: full (every config).
+          Suite subset to run: smoke | core | full | device_critical |
+          suite_<group> | <label> -- or the user-facing tier aliases unit
+          (= core) | integration (= device_critical) | regression (= full),
+          for callers (e.g. spyre-frameworks config.yaml) that speak in tier
+          names rather than label names. Default: device_critical (configs
+          whose test_suite_config.labels cover the device-layer surfaces
+          flex and deeptools/dxp_standalone exercise most -- streams, job
+          launch plans, codegen, LX/scratchpad planning, tensor layout,
+          allocator/GC, D2D copies). Pass "full" (or "regression") to run
+          every config.
         required: false
         type: string
-        default: full
+        default: device_critical
       prebaked_image:
         description: >-
           Test the pre-baked torch-spyre-dev image directly (no checkout/build) —
@@ -117,8 +133,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  # Run the full test matrix currently same as "run-tests" job in
-  # torch_spyre_tests.yaml
+  # Run the test matrix, defaulting to the device_critical subset -- same
+  # default as the "run-tests" job in torch_spyre_tests.yaml. Callers can
+  # still request test_type=full (or its alias, regression) for complete
+  # coverage. Tier aliases (unit/integration/regression) are resolved inside
+  # _test_matrix.yaml's generate_matrix job -- the single choke point every
+  # test_type caller (Makefile, Jenkins, GHA) passes through -- so the raw
+  # input is forwarded unchanged here.
   # ---------------------------------------------------------------------------
   run-tests:
     needs: provenance
@@ -130,7 +151,7 @@ jobs:
       checkout_pytorch: false
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
-      test_type: ${{ inputs.test_type || 'full' }}
+      test_type: ${{ inputs.test_type || 'device_critical' }}
       prebaked_image: ${{ inputs.prebaked_image }}
 
   # ----------------------------------------------------------------------------------

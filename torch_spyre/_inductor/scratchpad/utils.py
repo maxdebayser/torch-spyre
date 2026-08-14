@@ -65,6 +65,10 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
 )
 
 
+def round_up_to_alignment(arg: int, alignment: int) -> int:
+    return ((arg + alignment - 1) // alignment) * alignment
+
+
 def clone_at_graph_boundaries() -> bool:
     """True when clone ops are eligible for LX, enabling clone insertion at graph
     input/output boundaries so those buffers can also be LX-pinned.
@@ -75,20 +79,6 @@ def clone_at_graph_boundaries() -> bool:
     op suite), so coupling it here would silently turn on the boundary clone
     path in contexts that don't intend to exercise it."""
     return "clone" in OP_OUTPUT_GOOD_FOR_LX_REUSE
-
-
-class GraphView:
-    """
-    Simple wrapper which allows filtering of returned operations
-    without mutating the underlying graph.
-    """
-
-    def __init__(self, graph, predicate):
-        self.graph = graph
-        self.operations = predicate(graph)
-
-    def __getattr__(self, name):
-        return getattr(self.graph, name)
 
 
 def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
@@ -114,7 +104,7 @@ def calculate_liveness(graph: GraphLowering) -> dict[str, list[int]]:
 
 
 def mem_usage_by_buf(
-    graph: GraphLowering | GraphView,
+    graph: GraphLowering,
     cache: Optional[dict] = None,
 ) -> dict:
     """
@@ -124,7 +114,9 @@ def mem_usage_by_buf(
     NOTE:
     if a buf is not in core_div_mismatch => it has no users => graph output
     """
-    num_cores_per_op = get_ncores_for_buffers(graph, cache)
+    # The mismatch reasons are surfaced by the residency path; here only the
+    # per-buffer core count (with -1 marking a mismatch) drives mem_usage.
+    num_cores_per_op, _ = get_ncores_for_buffers(graph, cache)
     mem_usage: dict = {}
 
     for op in graph.operations:
@@ -133,8 +125,18 @@ def mem_usage_by_buf(
         num_cores = num_cores_per_op.get(buf_name, -1)
         rw = op_read_writes(op)
         layout = buf.layout
-        if isinstance(layout, MutationLayoutSHOULDREMOVE) or not isinstance(
-            op, ComputedBuffer
+        # Only ComputedBuffers backed by a real Spyre device layout
+        # (FixedTiledLayout, which carries ``device_layout``) can be sized for
+        # scratchpad/LX residency. Mutation aliases and plain host FixedLayout
+        # buffers (e.g. fallback / CPU-roundtrip outputs) have no device_layout,
+        # so they get the unsized sentinel below. Testing for FixedTiledLayout
+        # here — rather than the broader ``isinstance(layout, FixedLayout)`` —
+        # avoids excluding genuine device buffers, which subclass FixedLayout
+        # and must be sized (see the ``layout.device_layout`` access below).
+        if (
+            isinstance(layout, MutationLayoutSHOULDREMOVE)
+            or not isinstance(layout, FixedTiledLayout)
+            or not isinstance(op, ComputedBuffer)
         ):
             mem_usage[buf_name] = {
                 "size": -1,
@@ -159,7 +161,7 @@ def mem_usage_by_buf(
     return mem_usage
 
 
-def buffer_not_read_in_full(graph: GraphLowering | GraphView, buf_name: str) -> bool:
+def buffer_not_read_in_full(graph: GraphLowering, buf_name: str) -> bool:
     """True if any consumer reads less than the whole ``buf_name`` (a sliced,
     partial, or multi-offset read), or if the footprint can't be proven to
     cover the full buffer.
@@ -218,21 +220,73 @@ def _is_tiled_advancing(op: Operation) -> bool:
 
     LX addresses are never registered as ``affine.apply`` symbols in the SDSC
     JSON (see ``compute_ops.py``'s ``is_tiled_lx`` check), so a buffer that
-    advances per loop iteration (tiled, and not ``per_tile_fixed``) has no way
-    to express its address change if pinned to LX. This mirrors that check,
-    but at IR time via ``loop_info`` instead of the later per-tensor strides
-    representation, letting the allocator exclude such buffers from LX
-    candidacy up front instead of crashing at codegen time.
+    advances per loop iteration has no way to express its address change if
+    pinned to LX. This derives the same answer ``is_tiled_lx`` derives, but
+    earlier (at IR/allocation time) and directly from ``loop_info``, letting
+    the allocator exclude such buffers from LX candidacy up front instead of
+    crashing at codegen time.
+
+    Note this checks ``output_tiled_dims`` -- whether *this op's own write*
+    advances -- not ``loop_tiled_dims``, which only says the op is tiled at
+    all. A loop-internal buffer (e.g. drained by a copy op every iteration)
+    can be tiled yet have its own write pinned at a fixed address; such a
+    buffer is LX-eligible.
     """
     layout = getattr(op, "layout", None)
-    if not isinstance(layout, FixedTiledLayout) or layout.per_tile_fixed:
+    if not isinstance(layout, FixedTiledLayout):
         return False
     loop_info = getattr(op, "loop_info", None)
     if loop_info is None:
         return False
-    return any(dims for dims in loop_info.loop_tiled_dims) or any(
-        dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
-    )
+    return any(dims for dims in loop_info.output_tiled_dims)
+
+
+def _is_read_advancing_anywhere(
+    name: str, buf_user_deps: dict[str, list[tuple[Operation, MemoryDep]]]
+) -> bool:
+    """True if some op reads buffer ``name`` via an advancing reference.
+
+    ``_is_tiled_advancing`` only asks whether ``name``'s own *producing*
+    write advances -- it says nothing about whether some other, unrelated
+    op *reads* ``name`` via a reference that advances across that reader's
+    own coarse-tile loop (e.g. a full HBM buffer with a fixed write, copied
+    into a nested tile every outer iteration). ``SpyreKernel.
+    _general_tile_advance`` derives a read reference's
+    ``device_tile_advance_expr`` from the *consuming* op's own
+    ``loop_info.tiled_dims_per_read``, not from the producer's
+    ``output_tiled_dims`` -- so a reader can advance even when the
+    producer's own write is fixed. ``compute_ops.py``'s ``is_tiled_lx``
+    check applies to every ``TensorArg`` (read and write) at codegen time,
+    so missing this at allocation time defers the same
+    ``NotImplementedError`` to codegen instead of routing the buffer to
+    HBM up front.
+
+    Mirrors ``_general_tile_advance``'s own positional dep-index matching:
+    for each reader op, ``name``'s occurrences among that op's
+    ``MemoryDep`` reads are matched in order to
+    ``loop_info.tiled_dims_per_read`` by position.
+    """
+    for reader_op, dep in buf_user_deps.get(name, []):
+        loop_info = getattr(reader_op, "loop_info", None)
+        if loop_info is None:
+            continue
+        read_deps = [
+            d for d in op_read_writes(reader_op).reads if isinstance(d, MemoryDep)
+        ]
+        if dep not in read_deps:
+            continue  # dep is name's write on this op, not a read
+        dep_idx = read_deps.index(dep)
+        if dep_idx >= len(loop_info.tiled_dims_per_read):
+            continue
+        # Mirrors _general_tile_advance's own per-level loop: a dep whose
+        # outer per-level list is non-empty but every level's own
+        # (dim, extent) list is empty (e.g. [[], []]) still advances by
+        # zero -- _general_tile_advance's `if not dim_extent_pairs:
+        # continue` never contributes a term for such a level, so the
+        # resulting device_tile_advance_expr is None, not merely small.
+        if any(loop_info.tiled_dims_per_read[dep_idx]):
+            return True
+    return False
 
 
 def _writes_at_constant_offset(op: Operation) -> bool:
@@ -257,7 +311,7 @@ def _writes_at_constant_offset(op: Operation) -> bool:
 
 
 def ops_in_offset_mutation_component(
-    graph: GraphLowering | GraphView,
+    graph: GraphLowering,
 ) -> set[str]:
     """Names of ops data-connected to a sliced in-place mutation that writes at
     a constant non-zero offset (e.g. ``x[:, 32:96] = ...``).
@@ -321,7 +375,7 @@ def ops_in_offset_mutation_component(
     return component & op_names
 
 
-def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operation]]:
+def get_buffer_users(graph: GraphLowering) -> dict[str, list[Operation]]:
     buf_users_read_and_write: dict[str, list[Operation]] = {}
     for op in graph.operations:
         rw = op_read_writes(op)
@@ -332,7 +386,7 @@ def get_buffer_users(graph: GraphLowering | GraphView) -> dict[str, list[Operati
 
 
 def _get_buffer_user_deps(
-    graph: GraphLowering | GraphView,
+    graph: GraphLowering,
 ) -> dict[str, list[tuple[Operation, MemoryDep]]]:
     """Like get_buffer_users but pairs each op with the specific dep it uses.
 
@@ -363,25 +417,21 @@ def _op_num_cores(op: Operation) -> int:
 
 
 def get_ncores_for_buffers(
-    graph: GraphLowering | GraphView,
-    cache: Optional[dict] = None,
-    reject_reasons_out: Optional[dict[str, str]] = None,
-) -> dict[str, int]:
+    graph: GraphLowering, cache: Optional[dict] = None
+) -> tuple[dict[str, int], dict[str, str]]:
     """
-    Return a dictionary mapping buffer names to the number of cores
-    used by all the operations that uses the buffer.
-    If there is a core division mismatch return -1 instead of the
-    number of cores.
+    Return ``(num_cores, mismatch_reasons)``, where ``num_cores`` maps each
+    buffer name to the number of cores used by all the operations that use the
+    buffer (``-1`` on a core-division mismatch) and ``mismatch_reasons`` maps
+    each mismatched buffer name to a human-readable reason for the ``-1``.
 
     Pass an optional `cache` dict to memoize `_per_core_view_on_buf`
     results across calls (e.g. across co-opt search leaves). Safe to
     share only within a single graph, since the cache key includes the
     op name and `dep` (which carries the buffer name).
-
-    Pass an optional `reject_reasons_out` dict to receive detailed
-    reasons for core division mismatches (keyed by buffer name).
     """
     result: dict[str, int] = {}
+    mismatch_reasons_cache: dict[str, str] = {}
     using_multicore = config.sencores > 1
     buf_user_deps = _get_buffer_user_deps(graph)
     for buf_name, users in buf_user_deps.items():
@@ -444,8 +494,7 @@ def get_ncores_for_buffers(
                     break
             if mismatch_reason is not None:
                 num_cores = -1
-                if reject_reasons_out is not None:
-                    reject_reasons_out[buf_name] = mismatch_reason
+                mismatch_reasons_cache[buf_name] = mismatch_reason
             elif writer_cores is not None:
                 num_cores = writer_cores
             else:
@@ -457,7 +506,7 @@ def get_ncores_for_buffers(
         else:
             num_cores = 1
         result[buf_name] = num_cores
-    return result
+    return result, mismatch_reasons_cache
 
 
 class _GetLoadStoreIndices(WrapperHandler):
