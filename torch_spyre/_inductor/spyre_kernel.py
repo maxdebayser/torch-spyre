@@ -68,6 +68,7 @@ from torch_spyre._inductor.provenance import build_debug_handle
 import logging
 
 logger = get_inductor_logger("spyre_kernel")
+spyreop = torch.ops.spyre
 
 
 class RValue(ABC):
@@ -1097,6 +1098,8 @@ class SpyreKernel(Kernel[CSEVariable]):
             out_coords = args[-1].device_coordinates
             if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
                 # Broadcast: scalar input expanding to non-scalar output.
+                op = IDENTITY_OP
+            elif buf.origin_node.target == spyreop.reinterpret.default:
                 op = IDENTITY_OP
             elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:
                 op = RESTICKIFY_OP

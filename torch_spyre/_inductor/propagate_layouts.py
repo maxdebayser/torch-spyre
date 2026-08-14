@@ -704,6 +704,49 @@ def _clone_layout(
     return [out_stl]
 
 
+def _reinterpret_layout(
+    op: Operation,
+    output: FixedLayout,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
+    """
+    reinterpret can be used to interpret a sparse tensor that results from
+    a reduction. In this case only element of each stick will be valid, but
+    reinterpreting allows us to restickify or slice.
+    """
+    data = op.data
+
+    assert isinstance(data, Pointwise)
+    origin_node = next(iter(data.origins))
+    aten_op = origin_node.target
+    assert aten_op == spyreop.reinterpret.default
+
+    in_dep = args[0].dep
+    in_stl = next(iter(args[0].layouts))
+    in_device_coords = device_coordinates(in_stl, in_dep, None)
+    stick_expr = in_device_coords[-1]
+
+    # reinterpret preserves physical format, so a bool output must match its
+    # input's -- substitute the equivalent logical dtype since
+    # get_device_dtype(torch.bool) can't express that.
+    if output.dtype == torch.bool:
+        dtype_for_layout = resolve_bool_layout_dtype(in_stl, "clone")
+    else:
+        dtype_for_layout = output.dtype
+    stick_size = get_elem_in_stick(dtype_for_layout)
+
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    out_stl = SpyreTensorLayout(
+        c_size, c_stride, dtype_for_layout, list(range(len(output.size)))
+    )
+
+    if not is_stick_expr_offset_free(stick_expr, stick_size):
+        raise Unsupported("Reinterpret doesn't support stick expressions with offsets")
+    op.restick_cost_fn = AnyInNode.from_args()
+    return [out_stl]
+
+
 def _exx2_layout(
     op: Operation,
     output: FixedLayout,
@@ -1264,6 +1307,9 @@ def compute_layouts(
         # input stick — equivalent to a restickify. No restickify before it is needed,
         # unless there is an offset in the stick dimension.
         return _clone_layout(op, output, output_dep, args)
+
+    if aten_op == spyreop.reinterpret.default:
+        return _reinterpret_layout(op, output, args)
 
     # All other single arg ops
     layouts = []

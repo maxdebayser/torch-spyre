@@ -41,7 +41,7 @@ from .ir import (
     BroadcastAsyncFallback,
     WaitWorkFallback,
 )
-from torch_spyre._C import get_elem_in_stick
+from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
@@ -1606,3 +1606,46 @@ def lower_c10d_wait_tensor_async(tensor):
             tensor,
         )
     )
+
+
+@register_spyre_lowering(torch.ops.spyre.reinterpret)
+def lower_reinterpret(x):
+    # spyre::reinterpret injects the stick size as a new innermost PyTorch dim:
+    # sparse (*S) → dense (*S, elems_per_stick).
+    #
+    # Lowers to a Pointwise op over the expanded shape (*S, elems_per_stick).
+    # The loader ignores the innermost index and reads from the sparse input
+    # using only the outer (*S) indices — each sparse element occupies one
+    # stick, and this Pointwise broadcasts it across all 64 stick slots.
+    #
+    # A real output buffer is allocated (not a view), so the DCI generated
+    # for host↔device transfer uses the dense (*S, elems_per_stick) layout.
+    # The OpSpec replacement in spyre_kernel.py:store builds the correct
+    # device coordinates (bypassing compute_coordinates).
+    base = x
+    while not isinstance(base, StorageBox):
+        base = base.data
+
+    base.realize()
+
+    in_size = [int(s) for s in base.get_size()]
+    elems = SpyreTensorLayout([1], x.get_dtype()).elems_per_stick()
+    expanded_size = in_size + [elems]
+
+    loader = base.make_loader()
+
+    def inner_fn(index):
+        # index has len(expanded_size) entries; drop the last (stick slot).
+        return loader(list(index[: len(in_size)]))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=expanded_size,
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    return pw

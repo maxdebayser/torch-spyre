@@ -880,3 +880,19 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
     else:
         out_shape = out_shape[:dim] + out_shape[dim + 1 :]
     return torch.empty(out_shape, dtype=input.dtype, device=input.device)
+
+
+@torch.library.custom_op("spyre::reinterpret", mutates_args=(), device_types="spyre")
+def reinterpret(  # type: ignore[empty-body]
+    x: torch.Tensor,
+) -> torch.Tensor:
+    pass
+
+
+@reinterpret.register_fake
+def _(x: torch.Tensor) -> torch.Tensor:
+    from torch_spyre._C import SpyreTensorLayout
+
+    elems = SpyreTensorLayout([1], x.dtype).elems_per_stick()
+    expanded_size = list(x.size()) + [elems]
+    return x.new_empty(expanded_size)
