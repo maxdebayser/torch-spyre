@@ -799,14 +799,12 @@ def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     STL, not the desired dense (*S) STL.
     """
     in_size = list(x.size())
-    if in_size and in_size[-1] == 1:
+    if not in_size:
+        # Reduction of 1D tensor
+        return x
+    if in_size[-1] == 1:
         return torch.ops.spyre.compact_relabel(x)
-    expanded = torch.ops.spyre.reinterpret(x)
-    permuted = expanded.transpose(-1, -2)
-    materialized = permuted.clone(memory_format=torch.contiguous_format)
-    sliced = materialized[..., 0:1, :]
-    squeezed = sliced.squeeze(-2)
-    return squeezed * 1.0
+    return torch.ops.spyre.compact_copy(x)
 
 
 # Register decomposition for custom spyre op (not aten, so use decomp.register_decomposition directly)

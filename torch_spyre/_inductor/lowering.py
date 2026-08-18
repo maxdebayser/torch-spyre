@@ -21,6 +21,7 @@ import torch
 
 from torch._inductor.ir import Reduction, Pointwise, StorageBox
 import torch._inductor.lowering as lowering
+from torch._inductor.lowering import permute, slice_, squeeze
 import torch._inductor.ir as ir
 from typing import Any, Callable, Union
 
@@ -329,6 +330,18 @@ def _ensure_synthetic_origin(result, target, args: tuple) -> None:
     # buf.data is a frozen Loops; override its origins via object.__setattr__.
     object.__setattr__(buf.data, "origins", OrderedSet([fx_node]))
     buf.origins = OrderedSet([fx_node])
+
+    # origin_node should point at the enclosing custom-op FX node (e.g.
+    # compact_copy), not the synthetic decomposition node above — matching
+    # what GraphLowering.assign_origin_node stamps on a lowering's outermost
+    # return value. Intermediate buffers realized mid-lowering (e.g. this
+    # clone() called before the final return) never reach assign_origin_node,
+    # so stamp it here instead.
+    if buf.origin_node is None:
+        current_node = V.get_current_node()
+        buf.origin_node = current_node
+        if isinstance(buf.data, ir.Loops):
+            object.__setattr__(buf.data, "origin_node", current_node)
 
 
 @register_spyre_lowering(torch.ops.spyre.scaled_mm.default)
@@ -1101,24 +1114,11 @@ def lower_restickify(x):
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.reinterpret)
-def lower_reinterpret(x):
-    # spyre::reinterpret injects the stick size as a new innermost PyTorch dim:
-    # sparse (*S) → dense (*S, elems_per_stick).
-    #
-    # Lowers to a Pointwise op over the expanded shape (*S, elems_per_stick).
-    # The loader ignores the innermost index and reads from the sparse input
-    # using only the outer (*S) indices — each sparse element occupies one
-    # stick, and this Pointwise broadcasts it across all 64 stick slots.
-    #
-    # A real output buffer is allocated (not a view), so the DCI generated
-    # for host↔device transfer uses the dense (*S, elems_per_stick) layout.
-    # The OpSpec replacement in spyre_kernel.py:store builds the correct
-    # device coordinates (bypassing compute_coordinates).
+@register_spyre_lowering(torch.ops.spyre.compact_copy)
+def lower_compact_copy(x):
     base = x
     while not isinstance(base, StorageBox):
         base = base.data
-
     base.realize()
 
     in_size = [int(s) for s in base.get_size()]
@@ -1131,7 +1131,7 @@ def lower_reinterpret(x):
         # index has len(expanded_size) entries; drop the last (stick slot).
         return loader(list(index[: len(in_size)]))
 
-    pw = Pointwise.create(
+    reinterpret = Pointwise.create(
         device=x.get_device(),
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
@@ -1139,9 +1139,22 @@ def lower_reinterpret(x):
         origin_node=V.get_current_node(),
         traceback=x.get_traceback(),
     )
+    reinterpret.realize()
+    object.__setattr__(reinterpret.data.data, "_reinterpreted", True)
 
-    pw.realize()
-    return pw
+    dims = [i for i in range(len(reinterpret.get_size()))]
+    dims[-2], dims[-1] = dims[-1], dims[-2]
+
+    permuted = permute(reinterpret, dims)
+
+    # a restickify will be inserted here
+    restickify = clone(permuted)
+
+    sliced = slice_(restickify, -2, 0, 1, clamp=False)
+    squeezed = squeeze(sliced, -2)
+
+    cloned = clone(squeezed, memory_format=torch.contiguous_format)
+    return cloned
 
 
 @register_spyre_lowering(torch.ops.spyre.compact_relabel)

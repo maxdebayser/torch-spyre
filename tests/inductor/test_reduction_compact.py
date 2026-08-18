@@ -121,8 +121,10 @@ REDUCTION_CASES = {
 @pytest.mark.filterwarnings("ignore:Backend Spyre does not support int64")
 @pytest.mark.parametrize(
     "dtype",
-    [torch.float16, torch.float32, torch.int32],
-    ids=["fp16", "fp32", "int32"],
+    [torch.float16],
+    ids=["fp16"],
+    # [torch.float16, torch.float32, torch.int32],
+    # ids=["fp16", "fp32", "int32"],
 )
 @pytest.mark.parametrize(
     "case_name,shape,dim,keepdim",

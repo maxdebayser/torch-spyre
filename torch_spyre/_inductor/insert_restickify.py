@@ -161,6 +161,7 @@ def _create_restickify_node(
         assert isinstance(restick_buff, ComputedBuffer), (
             f"Expected ComputedBuffer, got {type(restick_buff).__name__}"
         )
+        restick_buff.origin_node = restick_fx_node
         restick_buff.origins = OrderedSet([restick_fx_node])
         graph_lowering.env[restick_fx_node] = restick_tb
         restick_buff.layout = restick_arg_info["target_layout"]

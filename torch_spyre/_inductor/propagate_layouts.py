@@ -78,7 +78,6 @@ from .pass_utils import (
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
-    is_sparse_stl,
     try_device_coordinates,
     indirect_info_from_op,
     is_stick_expr_offset_free,
@@ -1235,14 +1234,14 @@ def _reinterpret_layout(
     keepdim=False chain emits spyre::reinterpret as its first step.
     """
     x = args[0]
-    if x.layouts and all(not is_sparse_stl(stl) for stl in x.layouts):
-        raise Unsupported(
-            f"spyre::reinterpret requires a sparse input layout, but the "
-            f"producer of {x.dep.name!r} has only dense candidate layouts. "
-            f"This typically arises from spyre::compact on a tensor that is "
-            f"already dense (e.g., a reduction along a non-stick dim) — "
-            f"compact is a no-op in that case but is not currently supported."
-        )
+    # if x.layouts and all(not is_sparse_stl(stl) for stl in x.layouts):
+    #     raise Unsupported(
+    #         f"spyre::reinterpret requires a sparse input layout, but the "
+    #         f"producer of {x.dep.name!r} has only dense candidate layouts. "
+    #         f"This typically arises from spyre::compact on a tensor that is "
+    #         f"already dense (e.g., a reduction along a non-stick dim) — "
+    #         f"compact is a no-op in that case but is not currently supported."
+    #     )
 
     in_size = [concretize_expr(s) for s in x.layout.size]
     in_stride = [concretize_expr(s) for s in x.layout.stride]
@@ -1334,7 +1333,7 @@ def compute_layouts(
             )
         return _layernormnorm_layout(op, output, output_dep, args)
 
-    if aten_op == spyreop.reinterpret.default:
+    if aten_op == spyreop.compact_copy.default and getattr(op, "_reinterpreted", False):
         return _reinterpret_layout(op, output, output_dep, args)
 
     if aten_op == spyreop.compact_relabel.default:

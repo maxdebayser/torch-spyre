@@ -1341,9 +1341,13 @@ def _is_reinterpret_node(current_node: Any) -> bool:
         buf = current_node.node
         data = buf.data
         origins: set = getattr(data, "origins", set())
-        return bool(origins) and any(
-            getattr(n, "target", None) is torch.ops.spyre.reinterpret.default
-            for n in origins
+        return (
+            bool(origins)
+            and any(
+                getattr(n, "target", None) is torch.ops.spyre.compact_copy.default
+                for n in origins
+            )
+            and getattr(buf, "_reinterpreted", False)
         )
     except Exception:
         return False

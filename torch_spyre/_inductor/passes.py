@@ -468,6 +468,8 @@ class CustomPreSchedulingPasses:
                 "BEFORE PRE-SCHEDULING\n%s", format_operations(graph.operations)
             )
 
+        print("BEFORE PRE-SCHEDULING\n", format_operations(graph.operations))
+
         for pass_fn in self.passes:
             pass_name = _get_pass_name(pass_fn)
             # `graph` is the same object throughout -- passes mutate
@@ -491,6 +493,8 @@ class CustomPreSchedulingPasses:
 
         if logger.isEnabledFor(logging.INFO):
             logger.info("AFTER PRE-SCHEDULING\n%s", format_operations(graph.operations))
+
+        print("AFTER PRE-SCHEDULING\n", format_operations(graph.operations))
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)

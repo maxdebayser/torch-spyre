@@ -190,6 +190,7 @@ _SPYRE_METADATA_ATTRS = (
     # coarse_tile._propagate_tiled_reduction_op, read by finalize_layouts in
     # insert_restickify.py to overwrite accum_full's generic layout.
     "_tiled_reduction_accum_name",
+    "_reinterpreted",
 )
 
 
