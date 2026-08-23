@@ -1569,25 +1569,23 @@ def _build_compact_opspec(
 
     if not in_is_sparse:
         assert not out_is_sparse
-    restick = in_is_sparse and not out_is_sparse
-
-    in_coords = _reinterpret_coords(
-        [int(s) for s in in_stl.device_size],
-        [int(s) for s in in_stl.stride_map],
-        input_access.index,
-        it_space,
-    )
-
-    out_coords = _reinterpret_coords(
-        [int(s) for s in out_stl.device_size],
-        [int(s) for s in out_stl.stride_map],
-        output_access.index,
-        it_space,
-    )
+    restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
 
     op=IDENTITY_OP
     if restick:
+        in_coords = _reinterpret_coords(
+            [int(s) for s in in_stl.device_size],
+            [int(s) for s in in_stl.stride_map],
+            input_access.index,
+            it_space,
+        )
 
+        out_coords = _reinterpret_coords(
+            [int(s) for s in out_stl.device_size],
+            [int(s) for s in out_stl.stride_map],
+            output_access.index,
+            it_space,
+        )
         reinterpret_sym = sympy.Symbol("_spyre_reinterpret")
 
         if len(out_coords) == 2:
@@ -1600,7 +1598,6 @@ def _build_compact_opspec(
             out_coords[-1] = sympy.Mod(out_coords[-1],out_stl.elems_per_stick())
 
         out_coords.insert(0, sympy.floor(reinterpret_sym/out_stl.elems_per_stick()))
-        #out_coords.insert(0, reinterpret_sym)
         template_out.device_size.insert(0,1)
 
         assert len(in_stl.stride_map) >= 3
@@ -1612,6 +1609,20 @@ def _build_compact_opspec(
 
         it_space[reinterpret_sym] = 64
         op=RESTICKIFY_OP
+    else:
+        in_coords = compute_coordinates(
+            in_stl.device_size,
+            in_stl.stride_map,
+            it_space,
+            input_access.index,
+        )
+
+        out_coords = compute_coordinates(
+            out_stl.device_size,
+            out_stl.stride_map,
+            it_space,
+            output_access.index,
+        )
 
     template_in.device_coordinates = in_coords
     template_out.device_coordinates = out_coords
