@@ -42,7 +42,7 @@ from .ir import (
     BroadcastAsyncFallback,
     WaitWorkFallback,
 )
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import get_elem_in_stick
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
@@ -1101,67 +1101,20 @@ def lower_restickify(x):
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.reinterpret)
-def lower_reinterpret(x):
-    # spyre::reinterpret injects the stick size as a new innermost PyTorch dim:
-    # sparse (*S) → dense (*S, elems_per_stick).
+@register_spyre_lowering(torch.ops.spyre.compact)
+def lower_compact(x):
+    # Just emit a pointwise op here. At this point we only know that
+    # 1) the host output layout should be the same as the host input layout
+    # 2) the device output layout should be the default for the host layout
+    # 3) we don't know the device input layout
     #
-    # Lowers to a Pointwise op over the expanded shape (*S, elems_per_stick).
-    # The loader ignores the innermost index and reads from the sparse input
-    # using only the outer (*S) indices — each sparse element occupies one
-    # stick, and this Pointwise broadcasts it across all 64 stick slots.
-    #
-    # A real output buffer is allocated (not a view), so the DCI generated
-    # for host↔device transfer uses the dense (*S, elems_per_stick) layout.
-    # The OpSpec replacement in spyre_kernel.py:store builds the correct
-    # device coordinates (bypassing compute_coordinates).
-    base = x
-    while not isinstance(base, StorageBox):
-        base = base.data
+    # Later, during Opspec generation we have the input device layout and
+    # there we can decide to emit an identity or restickify and slice.
 
-    base.realize()
-
-    in_size = [int(s) for s in base.get_size()]
-    elems = SpyreTensorLayout([1], x.get_dtype()).elems_per_stick()
-    expanded_size = in_size + [elems]
-
-    loader = base.make_loader()
-
-    def inner_fn(index):
-        # index has len(expanded_size) entries; drop the last (stick slot).
-        return loader(list(index[: len(in_size)]))
-
-    pw = Pointwise.create(
-        device=x.get_device(),
-        dtype=x.get_dtype(),
-        inner_fn=inner_fn,
-        ranges=expanded_size,
-        origin_node=V.get_current_node(),
-        traceback=x.get_traceback(),
-    )
-
-    pw.realize()
-    return pw
-
-
-@register_spyre_lowering(torch.ops.spyre.compact_relabel)
-def lower_compact_relabel(x):
-    # spyre::compact_relabel: sparse (*S, 1) → dense (*S, 1).  Emitted by the
-    # compact decomposition for the keepdim=True case.  The output is a
-    # Pointwise clone of the input; _compact_relabel_layout (in
-    # propagate_layouts) assigns the dense default STL with AnyInNode, and the
-    # optimizer inserts a restickify upstream if the producer's STL is sparse.
-    #
-    # The keepdim=False path of compact is handled entirely by the
-    # decomposition (reinterpret → permute → clone → slice → squeeze → mul);
-    # no lowering of spyre::compact is needed.
-    base = x
-    while not isinstance(base, StorageBox):
-        base = base.data
-
-    base.realize()
-
-    loader = base.make_loader()
+    # Here we don't unwrap because we need to know what dimensions
+    # Pytorch is reasoning on.
+    x.realize()
+    loader = x.make_loader()
 
     def inner_fn(index):
         return loader(index)
@@ -1170,7 +1123,7 @@ def lower_compact_relabel(x):
         device=x.get_device(),
         dtype=x.get_dtype(),
         inner_fn=inner_fn,
-        ranges=base.get_size(),
+        ranges=x.get_size(),
         origin_node=V.get_current_node(),
         traceback=x.get_traceback(),
     )

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
@@ -50,6 +49,7 @@ from .pass_utils import (
     concretize_index,
     compute_symbolic_bounds,
     finite_upper_or_none,
+    is_sparse_stl,
     apply_splits_from_index_coeff,
     iteration_space,
     indirect_access_subs_from_kernel,
@@ -1049,37 +1049,6 @@ class SpyreKernel(Kernel[CSEVariable]):
                     value.op, False, args, op_info, self.indirect_var_names()
                 )
             )
-            # spyre::reinterpret lowers to a Pointwise that broadcasts each sparse
-            # element across all 64 stick slots.  compute_coordinates cannot invert
-            # the output's stride_map (two dims share stride 64), so replace the
-            # auto-generated OpSpec with a hand-crafted IDENTITY_OP.
-            if _is_reinterpret_node(self.current_node):
-                # The auto-generated OpSpec handles the sparse input correctly via
-                # compute_coordinates, but the output has an ambiguous stride_map
-                # (two device dims share stride 64), so compute_coordinates produces
-                # wrong output coords.  Replace only the output TensorArg.
-                try:
-                    it_sp = iteration_space(self.current_node)
-                    existing_spec = self.op_specs[-1]
-                    assert isinstance(existing_spec, OpSpec)
-                    out_arg = _build_reinterpret_out_arg(
-                        existing_spec.args[-1], dst, it_sp
-                    )
-                    new_spec = OpSpec(
-                        op=IDENTITY_OP,
-                        is_reduction=False,
-                        iteration_space=existing_spec.iteration_space,
-                        args=list(existing_spec.args[:-1]) + [out_arg],
-                        op_info={},
-                        tiled_symbols=[],
-                    )
-                    self.op_specs[-1] = new_spec
-                    logger.debug(f"reinterpret: replaced output TensorArg for {name!r}")
-                except Exception as _e:
-                    logger.warning(
-                        f"reinterpret OpSpec replacement failed for {name!r}: {_e}"
-                    )
-                    traceback.print_exc()
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
             # Compute which indirect variables THIS operation actually uses:
@@ -1125,25 +1094,12 @@ class SpyreKernel(Kernel[CSEVariable]):
                     self.create_tensor_arg(False, real_dst_name, dst),
                 ]
                 op_indirect_var_names = None
-            in_coords = args[-2].device_coordinates
-            out_coords = args[-1].device_coordinates
-            if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
-                # Broadcast: scalar input expanding to non-scalar output.
-                op = IDENTITY_OP
-            elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:
-                op = RESTICKIFY_OP
-            else:
-                op = IDENTITY_OP
-            op_spec = self.create_op_spec(
-                op, False, args, op_info, op_indirect_var_names
-            )
-            self.op_specs.append(op_spec)
-            # spyre::reinterpret: sparse (*S) → dense (*S, elems_per_stick).
-            # compute_coordinates cannot invert the expanded stride_map (fractional
-            # sympy coefficients), so replace the auto-generated OpSpec with a
-            # hand-crafted IDENTITY_OP whose coords are built directly from the
-            # device layout structure, bypassing compute_coordinates entirely.
-            if _is_reinterpret_node(self.current_node):
+
+            # Create custom opspec to fuse reinterpretation
+            # of the input tensor with transposing and slicing
+            # This requires an extra variable in the iteration
+            # space.
+            if _is_compact_node(self.current_node):
                 it_sp = iteration_space(self.current_node)
                 ir_node = self.current_node.node
                 wd: dict = {}
@@ -1154,14 +1110,26 @@ class SpyreKernel(Kernel[CSEVariable]):
                     wd = apply_splits_from_index_coeff(
                         ir_node.op_it_space_splits, wi, ri, it_sp
                     )
-                reinterp_spec = _build_reinterpret_opspec(
-                    op_spec.args[-2], op_spec.args[-1], value, dst, it_sp, wd
+                compact_spec = _build_compact_opspec(
+                    args[-2], args[-1], value, dst, it_sp, wd
                 )
-                self.op_specs[-1] = reinterp_spec
-                logger.debug(
-                    f"reinterpret: replaced OpSpec for {name!r} with hand-crafted identity, "
-                    f"work_division={wd}"
+                self.op_specs.append(compact_spec)
+            else:
+                in_coords = args[-2].device_coordinates
+                out_coords = args[-1].device_coordinates
+                if all(e == 0 for e in in_coords) and not all(
+                    e == 0 for e in out_coords
+                ):
+                    # Broadcast: scalar input expanding to non-scalar output.
+                    op = IDENTITY_OP
+                elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:
+                    op = RESTICKIFY_OP
+                else:
+                    op = IDENTITY_OP
+                op_spec = self.create_op_spec(
+                    op, False, args, op_info, op_indirect_var_names
                 )
+                self.op_specs.append(op_spec)
         else:
             raise Unsupported(f"store value of unexpected type {type(value)}")
 
@@ -1335,14 +1303,14 @@ class SpyreKernel(Kernel[CSEVariable]):
             wrapper.writeline(f"set_spyre_tensor_layout({target_name}, {alt_stl!r})")
 
 
-def _is_reinterpret_node(current_node: Any) -> bool:
-    """Return True if current_node's FX origin is spyre::reinterpret."""
+def _is_compact_node(current_node: Any) -> bool:
+    """Return True if current_node's FX origin is spyre::compact."""
     try:
         buf = current_node.node
         data = buf.data
         origins: set = getattr(data, "origins", set())
         return bool(origins) and any(
-            getattr(n, "target", None) is torch.ops.spyre.reinterpret.default
+            getattr(n, "target", None) is torch.ops.spyre.compact.default
             for n in origins
         )
     except Exception:
@@ -1355,36 +1323,6 @@ def _reinterpret_coords(
     index: "sympy.Expr",
     it_space: "dict[sympy.Symbol, sympy.Expr]",
 ) -> "list[sympy.Expr]":
-    """Build device coordinates for a reinterpret TensorArg without compute_coordinates.
-
-    Each iteration symbol's coefficient in the tensor's host index expression
-    is its host stride.  Matching ``stride_map[i]`` to the symbol with that
-    same host stride coefficient picks the right symbol regardless of how
-    sizes happen to coincide (e.g. M==elems_per_stick=64 for fp16, where two
-    real dims share device_size).
-
-    For sparse input (4, M=48) with index ``128*d0 + d2``:
-      d0 has coefficient 128 → that's the host stride of PyTorch dim 0 (M=48,
-      so stride 128 belongs to the leading dim).  d2 has coefficient 1 → the
-      innermost host dim.
-      Sparse device_size=[48, 1, 4, 64], stride_map=[1, -1, 128, -1]:
-        dim0 stride_map=1   → coef-1 symbol = d2 → c=d2
-        dim1 size=1                              → c=0
-        dim2 stride_map=128 → coef-128 symbol = d0 → c=d0
-        dim3 stride_map=-1                       → c=0 (synthetic stick)
-
-    For dense output (4, M=48, 64) with index ``8192*d0 + d1 + 64*d2``
-    (note: d1 is the new stick symbol, coefficient 1; d2 is the M symbol):
-      Dense device_size=[48, 1, 4, 64], stride_map=[64, 64, 8192, 1]:
-        dim0 stride_map=64   → coef-64 symbol = d2 → c=d2
-        dim1 size=1                               → c=0
-        dim2 stride_map=8192 → coef-8192 symbol = d0 → c=d0
-        dim3 stride_map=1    → coef-1 symbol = d1 → c=d1
-
-    Symbols that don't appear in the index (i.e. coefficient 0) are skipped
-    when building the lookup table — they correspond to dims that this tensor
-    doesn't see (e.g. the stick symbol in the sparse input's index).
-    """
     # Extract host stride for each iteration symbol from the index expression:
     # coefficient of `sym` in `index` = host stride of the host dim that `sym`
     # iterates over.  Symbols absent from the index get coefficient 0 and are
@@ -1414,86 +1352,98 @@ def _reinterpret_coords(
     return coords
 
 
-def _build_reinterpret_out_arg(
-    template: "TensorArg",
-    expanded_output: "TensorAccess",
-    it_space: "dict[sympy.Symbol, sympy.Expr]",
-) -> "TensorArg":
-    """Build the output TensorArg for a reinterpret store.
-
-    The dense output has stride_map with two dims sharing the same stride
-    (e.g. stride_map=[64, 64, 3072, 1] for (4,48,64)), which makes
-    compute_coordinates produce wrong coords.  We bypass it by deriving
-    iteration-symbol → host-stride from the index expression in
-    _reinterpret_coords, then matching device dims by stride_map.
-
-    ``template`` is the auto-generated (registered) output TensorArg; we mutate
-    it in place so that ``arg_index`` / ``allocation`` stay intact -- the arg is
-    the same object held by ``spyre_kernel_args``, so its ``arg_index`` is still
-    resolved by the later fix-up loop.  We override only the coordinates that
-    compute_coordinates got wrong.
-    """
-    out_stl = expanded_output.layout.device_layout
-    template.device_coordinates = _reinterpret_coords(
-        [int(s) for s in out_stl.device_size],
-        [int(s) for s in out_stl.stride_map],
-        expanded_output.index,
-        it_space,
-    )
-    return template
-
-
-def _build_reinterpret_opspec(
+def _build_compact_opspec(
     template_in: "TensorArg",
     template_out: "TensorArg",
-    sparse_input: "TensorAccess",
-    expanded_output: "TensorAccess",
+    input_access: "TensorAccess",
+    output_access: "TensorAccess",
     it_space: "dict[sympy.Symbol, sympy.Expr]",
     work_division: "dict[sympy.Symbol, int] | None" = None,
 ) -> "OpSpec":
-    """Hand-craft an IDENTITY_OP OpSpec for spyre::reinterpret.
+    """Hand-craft an OpSpec for spyre::compact.
 
-    reinterpret maps sparse (*S) → dense (*S, elems_per_stick).  The input and
-    output occupy the same physical bytes; the OpSpec is a zero-copy identity.
-
-    compute_coordinates cannot handle the expanded stride_map (it produces
-    fractional sympy coefficients), so coords are derived in _reinterpret_coords
-    by matching each iteration symbol's coefficient in the index expression
-    (its host stride) to the tensor's stride_map.
-
-    ``template_in`` / ``template_out`` are the auto-generated (registered)
-    TensorArgs; we mutate them in place so ``arg_index`` / ``allocation`` stay
-    intact -- they are the same objects held by ``spyre_kernel_args``, so their
-    ``arg_index`` is still resolved by the later fix-up loop.  We override only
-    the coordinates compute_coordinates got wrong.
-
-    Iteration space has (host_rank + 1) symbols: host dims + the stick symbol.
+    When there is no difference in sparseness between input
+    and output, it is just an identity. When the input is sparse
+    and has more than 1 dimension, this Op is a fuses the reinterpretation
+    of the input as a dense tensor with restification and slicing
     """
-    in_stl = sparse_input.layout.device_layout
-    out_stl = expanded_output.layout.device_layout
+    in_stl = input_access.layout.device_layout
+    out_stl = output_access.layout.device_layout
 
-    template_in.device_coordinates = _reinterpret_coords(
-        [int(s) for s in in_stl.device_size],
-        [int(s) for s in in_stl.stride_map],
-        sparse_input.index,
-        it_space,
-    )
-    template_out.device_coordinates = _reinterpret_coords(
-        [int(s) for s in out_stl.device_size],
-        [int(s) for s in out_stl.stride_map],
-        expanded_output.index,
-        it_space,
-    )
+    in_is_sparse = is_sparse_stl(in_stl)
+    out_is_sparse = is_sparse_stl(out_stl)
+
+    if not in_is_sparse:
+        assert not out_is_sparse
+    restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
+
+    op = IDENTITY_OP
+    if restick:
+        in_coords = _reinterpret_coords(
+            [int(s) for s in in_stl.device_size],
+            [int(s) for s in in_stl.stride_map],
+            input_access.index,
+            it_space,
+        )
+
+        out_coords = _reinterpret_coords(
+            [int(s) for s in out_stl.device_size],
+            [int(s) for s in out_stl.stride_map],
+            output_access.index,
+            it_space,
+        )
+        reinterpret_sym = sympy.Symbol("_spyre_reinterpret")
+
+        if len(out_coords) == 2:
+            assert out_coords[0] == 0
+            out_coords[-2] = sympy.floor(out_coords[-1] / out_stl.elems_per_stick())
+            out_coords[-1] = sympy.Mod(out_coords[-1], out_stl.elems_per_stick())
+        else:
+            assert out_coords[-3] == 0
+            out_coords[-3] = sympy.floor(out_coords[-1] / out_stl.elems_per_stick())
+            out_coords[-1] = sympy.Mod(out_coords[-1], out_stl.elems_per_stick())
+
+        out_coords.insert(0, sympy.floor(reinterpret_sym / out_stl.elems_per_stick()))
+        template_out.device_size.insert(0, 1)
+
+        assert len(in_stl.stride_map) >= 3
+        assert in_stl.stride_map[-1] == -1
+        assert in_stl.stride_map[-3] == -1
+
+        in_coords[-3] = sympy.floor(reinterpret_sym / in_stl.elems_per_stick())
+        in_coords[-1] = sympy.Mod(reinterpret_sym, in_stl.elems_per_stick())
+
+        it_space[reinterpret_sym] = 64
+        op = RESTICKIFY_OP
+    else:
+        in_coords = compute_coordinates(
+            in_stl.device_size,
+            in_stl.stride_map,
+            it_space,
+            input_access.index,
+        )
+
+        out_coords = compute_coordinates(
+            out_stl.device_size,
+            out_stl.stride_map,
+            it_space,
+            output_access.index,
+        )
+
+    template_in.device_coordinates = in_coords
+    template_out.device_coordinates = out_coords
 
     in_arg = template_in
     out_arg = template_out
 
     wd = work_division or {}
-    it_space_extended = {k: (v, wd.get(k, 1)) for k, v in it_space.items()}
+
+    it_space = {k: (v, wd.get(k, 1)) for k, v in it_space.items()}
+
     return OpSpec(
-        op=IDENTITY_OP,
+        op=op,
         is_reduction=False,
-        iteration_space=it_space_extended,
+        iteration_space=it_space,
         args=[in_arg, out_arg],
         op_info={},
         tiled_symbols=[],

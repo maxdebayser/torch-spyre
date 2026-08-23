@@ -78,7 +78,6 @@ from .pass_utils import (
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
-    is_sparse_stl,
     try_device_coordinates,
     indirect_info_from_op,
     is_stick_expr_offset_free,
@@ -1202,71 +1201,13 @@ def _topk_layouts(
     return results
 
 
-def _reinterpret_layout(
+def _compact_layout(
     op: Operation,
     output: FixedLayout,
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
-    """Layout for spyre::reinterpret.
-
-    reinterpret expands a sparse (*S) tensor to a dense (*S, elems_per_stick)
-    Pointwise buffer.  The output has host shape (*S, elems_per_stick) and
-    needs a standard dense layout for that shape.
-
-    The synthetic 64 axis is appended at the end, so the input's sparse
-    stick must correspond to the last PyTorch dim.  We require the
-    canonical sparse STL (dim_order = list(range(rank)) + [-1]); EdgeCostMap
-    will insert a restickify if the producer's sparse stick is elsewhere.
-    Without this constraint, the lowering's assumption that slot 0 of the
-    trailing 64 axis holds the valid value is only true when the producer
-    happens to put its stick on the last PyTorch dim — and the
-    keepdim=False chain in compact_decomp would silently miscompile
-    otherwise.
-
-    The input's sparse STL is read by the OpSpec replacement in spyre_kernel.py
-    (not here); this function only assigns layouts.
-
-    Reinterpret on dense input is rejected here.  The op's contract is
-    sparse → dense; on dense input the broadcast loader and identity OpSpec
-    produce silently-incorrect bytes (each output stick gets 64 copies of
-    one input element instead of the original 64 distinct values).  This
-    also rejects compact-on-dense, since the compact decomposition's
-    keepdim=False chain emits spyre::reinterpret as its first step.
-    """
-    x = args[0]
-    if x.layouts and all(not is_sparse_stl(stl) for stl in x.layouts):
-        raise Unsupported(
-            f"spyre::reinterpret requires a sparse input layout, but the "
-            f"producer of {x.dep.name!r} has only dense candidate layouts. "
-            f"This typically arises from spyre::compact on a tensor that is "
-            f"already dense (e.g., a reduction along a non-stick dim) — "
-            f"compact is a no-op in that case but is not currently supported."
-        )
-
-    in_size = [concretize_expr(s) for s in x.layout.size]
-    in_stride = [concretize_expr(s) for s in x.layout.stride]
-    in_dim_order = list(range(len(in_size))) + [-1]
-    req_in_stl = SpyreTensorLayout(in_size, in_stride, x.layout.dtype, in_dim_order)
-
-    c_size = [concretize_expr(s) for s in output.size]
-    out_stl = SpyreTensorLayout(c_size, output.dtype)
-    op.restick_cost_fn = FixedInOutNode.from_args(args, out_stl, [req_in_stl], op)
-    return [out_stl]
-
-
-def _compact_relabel_layout(
-    op: Operation,
-    output: FixedLayout,
-    output_dep: MemoryDep,
-    args: list[PropArg],
-) -> list[SpyreTensorLayout]:
-    """Layout for spyre::compact_relabel: output is the default dense STL.
-
-    Input may be sparse or dense; AnyInNode lets the optimizer schedule a
-    restickify when the input STL doesn't match the output dense STL.
-    This is the same pattern used by clone for layout transitions.
-    """
+    """Layout for spyre::compact: output is the default dense STL."""
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(
@@ -1334,11 +1275,8 @@ def compute_layouts(
             )
         return _layernormnorm_layout(op, output, output_dep, args)
 
-    if aten_op == spyreop.reinterpret.default:
-        return _reinterpret_layout(op, output, output_dep, args)
-
-    if aten_op == spyreop.compact_relabel.default:
-        return _compact_relabel_layout(op, output, output_dep, args)
+    if aten_op == spyreop.compact.default:
+        return _compact_layout(op, output, output_dep, args)
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of

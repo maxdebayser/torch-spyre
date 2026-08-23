@@ -260,10 +260,11 @@ def insert_restickify_on_node_inputs(
 
 
 def insert_restickify(graph: GraphLowering) -> None:
-    """Insert restickify operations from the finalize_layouts plan.
+    """Insert restickify operations before all nodes in restickify_plan.
 
-    Splices ComputedBuffer restickify nodes into the operations list before
-    their consumers.  No scheduler state is touched.
+    Consumes graph.restickify_plan (built by finalize_layouts) and splices the
+    necessary ComputedBuffer nodes into the operations list in-place.
+    No scheduler state is touched.
     """
     operations = graph.operations
     restickify_plan = graph.restickify_plan
@@ -364,8 +365,8 @@ def finalize_layouts(graph: GraphLowering) -> None:
                                 accum_layout, op.layout.device_layout
                             )
 
-        # For each input edge, schedule a restickify if the input's committed
-        # STL is incompatible with what this op requires on that edge.
+        # For each input edge, schedule a restickify if the input's committed STL
+        # is incompatible with what this op requires on that edge.
         if not cost_fn:
             continue
         # Mutation ops targeting a SpyreEmptyFallback: the optimizer commits the
@@ -424,17 +425,17 @@ def finalize_layouts(graph: GraphLowering) -> None:
                 )
                 in_layout = in_layout.real_layout()
             in_stl = in_layout.device_layout
-            result = edge.layout(in_stl, target_stl)
-            if result is None:
+            restick_stl = edge.layout(in_stl, target_stl)
+            if restick_stl is None:
                 continue
-            if result is EdgeCostMap.INFEASIBLE:
+            if restick_stl is EdgeCostMap.INFEASIBLE:
                 raise AssertionError(
                     f"finalize_layouts: restickify needed but infeasible for "
                     f"op={op.get_name()!r} input={edge.dep.name!r}: "
                     f"in_stl.stride_map={list(in_stl.stride_map)} "
                     f"target_stl.stride_map={list(target_stl.stride_map)}"
                 )
-            restick_target = _fixed_tiled(in_layout, result)
+            restick_target = _fixed_tiled(in_layout, restick_stl)
             logger.info(
                 f"Injecting restickify on {op.get_name()} input {edge.dep.name}: "
                 f"{list(in_stl.stride_map)} -> {list(target_stl.stride_map)}"

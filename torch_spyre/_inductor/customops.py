@@ -420,42 +420,6 @@ def _(x: torch.Tensor) -> torch.Tensor:
     return x.new_empty(x.size())
 
 
-# spyre::compact_relabel is the keepdim=True half of spyre::compact: a
-# zero-cost sparse → dense layout relabel for inputs whose trailing dim is
-# size 1.  It is produced exclusively by the compact decomposition (see
-# decompositions.py::compact_decomp); user code should call spyre::compact.
-# Having a dedicated op keeps the keepdim=True lowering's role explicit and
-# lets propagate_layouts dispatch on FX origin alone.
-@torch.library.custom_op(
-    "spyre::compact_relabel", mutates_args=(), device_types="spyre"
-)
-def compact_relabel(  # type: ignore[empty-body]
-    x: torch.Tensor,
-) -> torch.Tensor:
-    pass
-
-
-@compact_relabel.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    return x.new_empty(x.size())
-
-
-@torch.library.custom_op("spyre::reinterpret", mutates_args=(), device_types="spyre")
-def reinterpret(  # type: ignore[empty-body]
-    x: torch.Tensor,
-) -> torch.Tensor:
-    pass
-
-
-@reinterpret.register_fake
-def _(x: torch.Tensor) -> torch.Tensor:
-    from torch_spyre._C import SpyreTensorLayout
-
-    elems = SpyreTensorLayout([1], x.dtype).elems_per_stick()
-    expanded_size = list(x.size()) + [elems]
-    return x.new_empty(expanded_size)
-
-
 @torch.library.custom_op("spyre::max_dim_int64_fallback", mutates_args=())
 def max_dim_int64_fallback(
     input: torch.Tensor, dim: int, keepdim: bool = False
