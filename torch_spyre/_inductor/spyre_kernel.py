@@ -50,6 +50,7 @@ from .pass_utils import (
     concretize_index,
     compute_symbolic_bounds,
     finite_upper_or_none,
+    is_sparse_stl,
     apply_splits_from_index_coeff,
     iteration_space,
     indirect_access_subs_from_kernel,
@@ -1080,6 +1081,8 @@ class SpyreKernel(Kernel[CSEVariable]):
                         f"reinterpret OpSpec replacement failed for {name!r}: {_e}"
                     )
                     traceback.print_exc()
+            if _is_compact_node(self.current_node):
+                raise Exception("TODO 1")
         elif isinstance(value, TensorAccess):
             # Reshapes, transposes, and other dataops.
             # Compute which indirect variables THIS operation actually uses:
@@ -1155,6 +1158,25 @@ class SpyreKernel(Kernel[CSEVariable]):
                         ir_node.op_it_space_splits, wi, ri, it_sp
                     )
                 reinterp_spec = _build_reinterpret_opspec(
+                    op_spec.args[-2], op_spec.args[-1], value, dst, it_sp, wd
+                )
+                self.op_specs[-1] = reinterp_spec
+                logger.debug(
+                    f"reinterpret: replaced OpSpec for {name!r} with hand-crafted identity, "
+                    f"work_division={wd}"
+                )
+            if _is_compact_node(self.current_node):
+                it_sp = iteration_space(self.current_node)
+                ir_node = self.current_node.node
+                wd: dict = {}
+                if hasattr(ir_node, "op_it_space_splits"):
+                    rw = self.current_node.read_writes
+                    wi = next(iter(rw.writes)).index
+                    ri = next((d.index for d in rw.reads), wi)
+                    wd = apply_splits_from_index_coeff(
+                        ir_node.op_it_space_splits, wi, ri, it_sp
+                    )
+                reinterp_spec = _build_compact_opspec(
                     op_spec.args[-2], op_spec.args[-1], value, dst, it_sp, wd
                 )
                 self.op_specs[-1] = reinterp_spec
@@ -1348,6 +1370,19 @@ def _is_reinterpret_node(current_node: Any) -> bool:
     except Exception:
         return False
 
+def _is_compact_node(current_node: Any) -> bool:
+    """Return True if current_node's FX origin is spyre::compact."""
+    try:
+        buf = current_node.node
+        data = buf.data
+        origins: set = getattr(data, "origins", set())
+        return bool(origins) and any(
+            getattr(n, "target", None) is torch.ops.spyre.compact.default
+            for n in origins
+        )
+    except Exception:
+        return False
+
 
 def _reinterpret_coords(
     device_size: "list[int]",
@@ -1494,6 +1529,104 @@ def _build_reinterpret_opspec(
         op=IDENTITY_OP,
         is_reduction=False,
         iteration_space=it_space_extended,
+        args=[in_arg, out_arg],
+        op_info={},
+        tiled_symbols=[],
+    )
+
+
+def _build_compact_opspec(
+    template_in: "TensorArg",
+    template_out: "TensorArg",
+    input_access: "TensorAccess",
+    output_access: "TensorAccess",
+    it_space: "dict[sympy.Symbol, sympy.Expr]",
+    work_division: "dict[sympy.Symbol, int] | None" = None,
+) -> "OpSpec":
+    """Hand-craft an IDENTITY_OP OpSpec for spyre::reinterpret.
+
+    reinterpret maps sparse (*S) → dense (*S, elems_per_stick).  The input and
+    output occupy the same physical bytes; the OpSpec is a zero-copy identity.
+
+    compute_coordinates cannot handle the expanded stride_map (it produces
+    fractional sympy coefficients), so coords are derived in _reinterpret_coords
+    by matching each iteration symbol's coefficient in the index expression
+    (its host stride) to the tensor's stride_map.
+
+    ``template_in`` / ``template_out`` are the auto-generated (registered)
+    TensorArgs; we mutate them in place so ``arg_index`` / ``allocation`` stay
+    intact -- they are the same objects held by ``spyre_kernel_args``, so their
+    ``arg_index`` is still resolved by the later fix-up loop.  We override only
+    the coordinates compute_coordinates got wrong.
+
+    Iteration space has (host_rank + 1) symbols: host dims + the stick symbol.
+    """
+    in_stl = input_access.layout.device_layout
+    out_stl = output_access.layout.device_layout
+
+    in_is_sparse = is_sparse_stl(in_stl)
+    out_is_sparse = is_sparse_stl(out_stl)
+
+    if not in_is_sparse:
+        assert not out_is_sparse
+    restick = in_is_sparse and not out_is_sparse
+
+    in_coords = _reinterpret_coords(
+        [int(s) for s in in_stl.device_size],
+        [int(s) for s in in_stl.stride_map],
+        input_access.index,
+        it_space,
+    )
+
+    out_coords = _reinterpret_coords(
+        [int(s) for s in out_stl.device_size],
+        [int(s) for s in out_stl.stride_map],
+        output_access.index,
+        it_space,
+    )
+
+    op=IDENTITY_OP
+    if restick:
+
+        reinterpret_sym = sympy.Symbol("_spyre_reinterpret")
+
+        if len(out_coords) == 2:
+            assert out_coords[0] == 0
+            out_coords[-2] = sympy.floor(out_coords[-1]/out_stl.elems_per_stick())
+            out_coords[-1] = sympy.Mod(out_coords[-1],out_stl.elems_per_stick())
+        else:
+            assert out_coords[-3] == 0
+            out_coords[-3] = sympy.floor(out_coords[-1]/out_stl.elems_per_stick())
+            out_coords[-1] = sympy.Mod(out_coords[-1],out_stl.elems_per_stick())
+
+        out_coords.insert(0, sympy.floor(reinterpret_sym/out_stl.elems_per_stick()))
+        #out_coords.insert(0, reinterpret_sym)
+        template_out.device_size.insert(0,1)
+
+        assert len(in_stl.stride_map) >= 3
+        assert in_stl.stride_map[-1] == -1
+        assert in_stl.stride_map[-3] == -1
+
+        in_coords[-3] = sympy.floor(reinterpret_sym/in_stl.elems_per_stick())
+        in_coords[-1] = sympy.Mod(reinterpret_sym,in_stl.elems_per_stick())
+
+        it_space[reinterpret_sym] = 64
+        op=RESTICKIFY_OP
+
+    template_in.device_coordinates = in_coords
+    template_out.device_coordinates = out_coords
+
+    in_arg = template_in
+    out_arg = template_out
+
+    wd = work_division or {}
+
+    it_space = {k: (v, wd.get(k, 1)) for k, v in it_space.items()}
+
+    return OpSpec(
+        op=op,
+        is_reduction=False,
+        iteration_space=it_space,
         args=[in_arg, out_arg],
         op_info={},
         tiled_symbols=[],

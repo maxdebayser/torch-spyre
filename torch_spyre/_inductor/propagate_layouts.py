@@ -1261,6 +1261,27 @@ def _compact_relabel_layout(
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
+    """Layout for spyre::compact: output is the default dense STL.
+
+    Input may be sparse or dense; AnyInNode lets the optimizer schedule a
+    restickify when the input STL doesn't match the output dense STL.
+    This is the same pattern used by clone for layout transitions.
+    """
+    print(f"compact_relabel")
+    c_size = [concretize_expr(s) for s in output.size]
+    c_stride = [concretize_expr(s) for s in output.stride]
+    out_stl = SpyreTensorLayout(
+        c_size, c_stride, output.dtype, list(range(len(output.size)))
+    )
+    op.restick_cost_fn = AnyInNode.from_args()
+    return [out_stl]
+
+def _compact_layout(
+    op: Operation,
+    output: FixedLayout,
+    output_dep: MemoryDep,
+    args: list[PropArg],
+) -> list[SpyreTensorLayout]:
     """Layout for spyre::compact_relabel: output is the default dense STL.
 
     Input may be sparse or dense; AnyInNode lets the optimizer schedule a
@@ -1339,6 +1360,9 @@ def compute_layouts(
 
     if aten_op == spyreop.compact_relabel.default:
         return _compact_relabel_layout(op, output, output_dep, args)
+
+    if aten_op == spyreop.compact.default:
+        return _compact_layout(op, output, output_dep, args)
 
     if aten_op == aten.clone.default:
         # clone materializes a new buffer in a fixed row-major layout regardless of

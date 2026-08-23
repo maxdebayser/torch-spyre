@@ -769,7 +769,7 @@ def conv2d_via_bmm_decomp(
     return output
 
 
-@register_spyre_decompositions([torch.ops.spyre.compact.default])
+#@register_spyre_decompositions([torch.ops.spyre.compact.default])
 def compact_decomp(x: torch.Tensor) -> torch.Tensor:
     """Decompose spyre::compact into native ops with their own FX origins.
 

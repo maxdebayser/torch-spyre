@@ -1179,6 +1179,40 @@ def lower_compact_relabel(x):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.compact)
+def lower_compact(x):
+    # spyre::compact_relabel: sparse (*S, 1) → dense (*S, 1).  Emitted by the
+    # compact decomposition for the keepdim=True case.  The output is a
+    # Pointwise clone of the input; _compact_relabel_layout (in
+    # propagate_layouts) assigns the dense default STL with AnyInNode, and the
+    # optimizer inserts a restickify upstream if the producer's STL is sparse.
+    #
+    # The keepdim=False path of compact is handled entirely by the
+    # decomposition (reinterpret → permute → clone → slice → squeeze → mul);
+    # no lowering of spyre::compact is needed.
+    base = x
+    #while not isinstance(base, StorageBox):
+    #    base = base.data
+
+    base.realize()
+
+    loader = base.make_loader()
+
+    def inner_fn(index):
+        return loader(index)
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=base.get_size(),
+        origin_node=V.get_current_node(),
+        traceback=x.get_traceback(),
+    )
+
+    pw.realize()
+    return pw
+
 @register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
 def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):
     assert layout in (torch.strided, None), f"doesn't support layout={layout}"
