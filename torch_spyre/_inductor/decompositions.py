@@ -769,46 +769,6 @@ def conv2d_via_bmm_decomp(
     return output
 
 
-#@register_spyre_decompositions([torch.ops.spyre.compact.default])
-def compact_decomp(x: torch.Tensor) -> torch.Tensor:
-    """Decompose spyre::compact into native ops with their own FX origins.
-
-    Two paths, distinguished by the trailing dim of the input:
-
-    keepdim=True (trailing size-1):  delegate to spyre::compact_relabel,
-        a dedicated op whose layout handler stamps the dense default STL on
-        the output and accepts any input STL via AnyInNode.  The optimizer
-        inserts a sparse → dense restickify upstream when the producer is
-        sparse.
-
-    keepdim=False (no trailing size-1):
-        reinterpret(x)      # (*S, 64) — slot 0 of each stick is valid
-        .transpose(-1, -2)  # (*S[:-1], 64, S[-1]) — move size-64 off stick dim
-        .clone()            # dense materialization (FX origin = aten.clone)
-        [..., 0:1, :]       # take slot 0 (non-stick axis after permute)
-        .squeeze(-2)        # (*S) — pure view
-        * 1.0               # Pointwise mul forces a real ComputedBuffer
-                            #   with the squeezed PyTorch shape; its layout-
-                            #   prop handler assigns the dense default STL
-                            #   for (*S).
-
-    Without the trailing mul, AOTAutograd would elide a final .clone()
-    because `squeeze(slice(clone))` is already PyTorch-contiguous, leaving
-    the user-visible output as a bare reinterpret_tensor view of the
-    post-permute clone — which inherits the (*S[:-1], 64, S[-1]) clone's
-    STL, not the desired dense (*S) STL.
-    """
-    in_size = list(x.size())
-    if in_size and in_size[-1] == 1:
-        return torch.ops.spyre.compact_relabel(x)
-    expanded = torch.ops.spyre.reinterpret(x)
-    permuted = expanded.transpose(-1, -2)
-    materialized = permuted.clone(memory_format=torch.contiguous_format)
-    sliced = materialized[..., 0:1, :]
-    squeezed = sliced.squeeze(-2)
-    return squeezed * 1.0
-
-
 # Register decomposition for custom spyre op (not aten, so use decomp.register_decomposition directly)
 @register_spyre_decompositions([torch.ops.spyre.dequantize_fp8_with_scale])
 def dequantize_fp8_with_scale_decomp(
