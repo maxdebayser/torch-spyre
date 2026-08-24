@@ -34,11 +34,7 @@ from torch._inductor.ir import (
 )
 from torch._inductor.virtualized import V
 from torch_spyre._C import SpyreTensorLayout
-from .pass_utils import (
-    compute_restickify_needed,
-    device_coordinates,
-    host_coordinates,
-)
+from .pass_utils import compute_restickify_needed, device_coordinates, host_coordinates
 
 INF = math.inf
 
