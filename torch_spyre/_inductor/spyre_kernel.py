@@ -57,6 +57,7 @@ from .pass_utils import (
     compute_symbolic_bounds,
     finite_upper_or_none,
     is_sparse_stl,
+    _is_compact_node,
     apply_splits_from_index_coeff,
     iteration_space,
     indirect_access_subs_from_kernel,
@@ -1382,20 +1383,6 @@ class SpyreKernel(Kernel[CSEVariable]):
         wrapper = V.graph.wrapper_code
         for target_name, alt_stl in restores:
             wrapper.writeline(f"set_spyre_tensor_layout({target_name}, {alt_stl!r})")
-
-
-def _is_compact_node(current_node: Any) -> bool:
-    """Return True if current_node's FX origin is spyre::compact."""
-    try:
-        buf = current_node.node
-        data = buf.data
-        origins: set = getattr(data, "origins", set())
-        return bool(origins) and any(
-            getattr(n, "target", None) is torch.ops.spyre.compact.default
-            for n in origins
-        )
-    except Exception:
-        return False
 
 
 def _reinterpret_coords(
