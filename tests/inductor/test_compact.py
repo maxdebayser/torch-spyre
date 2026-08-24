@@ -24,10 +24,21 @@ import torch._dynamo as dynamo
 
 import torch_spyre._inductor.passes as _passes
 from torch._inductor.virtualized import V
+from torch._inductor.codecache import FxGraphCache
 from torch_spyre._C import SpyreTensorLayout, get_spyre_dma_sizes, get_spyre_dma_strides
 from utils_inductor import _compile_and_run
 
 DEVICE = torch.device("spyre")
+
+
+@pytest.fixture(autouse=True)
+def _reset_compile_caches():
+    # sum_and_compact_compiled is one module-level compiled function shared by
+    # every case below; each (dim, keepdim) combination specializes it anew,
+    # which would otherwise blow past Dynamo's per-function recompile limit.
+    torch._dynamo.reset_code_caches()
+    FxGraphCache.clear()
+    yield
 
 
 # -------- Helpers --------
