@@ -89,8 +89,11 @@ class EdgeCostMap:
     ) -> None:
         """Populate _cost and _layout for (in_stl, target_stl).
 
-        Cost is 0 if stick-compatible, the input element count if
-        restickifiable, or INF if infeasible.
+        Cost is 0 if stick-compatible, the input element count if restickifiable, or INF if infeasible.
+        _layout stores:
+          None               — compatible, no restickify needed
+          INFEASIBLE         — restickify needed but compute_restickify_target_layout returned None
+          SpyreTensorLayout  — feasible restickify target layout
         """
         needed, tgt = compute_restickify_needed(
             in_stl, self._dep_layout, self.dep, target_stl, self._target_dep, self._op
