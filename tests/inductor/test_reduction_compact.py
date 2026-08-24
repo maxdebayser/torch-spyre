@@ -141,7 +141,7 @@ def test_sum_and_compact(case_name, shape, dim, keepdim, dtype):
     actual = sum_and_compact_compiled(x_cpu.to(DEVICE), dim, keepdim)
     expected = x_cpu.sum(dim, keepdim).to(DEVICE)
 
-    #_assert_layout_matches(actual, expected)
+    # _assert_layout_matches(actual, expected)
     torch.testing.assert_close(
         actual.cpu(), expected.cpu(), equal_nan=True, **_TOLERANCES[dtype]
     )

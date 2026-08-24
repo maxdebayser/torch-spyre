@@ -248,7 +248,6 @@ def test_compact_3d_layouts():
     )
 
 
-
 # -------- Tests: keepdim=False (3D input → 2D sparse → compact → 2D dense) --------
 #
 # All dim sizes must be multiples of 64 (stick size for fp16) due to a known
@@ -276,6 +275,7 @@ def test_compact_keepdim_false_3d_correctness():
 #
 # A sparse tensor can be passed in as a graph input by constructing it on the
 # host with an explicit device_layout=SpyreTensorLayout(..., dim_order).
+
 
 def _sparse_graph_input(
     host_tensor: torch.Tensor, dim_order: list[int]

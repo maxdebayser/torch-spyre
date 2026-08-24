@@ -7,8 +7,8 @@ filename = Path(__file__).stem
 
 DTYPES = [torch.float16]
 DTYPE_IDS = ["fp16"]
-#DTYPES=[torch.float16, torch.float32, torch.int32]
-#DTYPE_IDS=["fp16", "fp32", "int32"]
+# DTYPES=[torch.float16, torch.float32, torch.int32]
+# DTYPE_IDS=["fp16", "fp32", "int32"]
 
 BOTH = [False, True]
 
@@ -31,7 +31,9 @@ def maybe_compact(x: torch.Tensor, compact: bool):
     return x
 
 
-def run_binary_op(func, device, dtype, dim, compact, reduce_keep_dim, pre_op_keep_dim, a, b):
+def run_binary_op(
+    func, device, dtype, dim, compact, reduce_keep_dim, pre_op_keep_dim, a, b
+):
     if pre_op_keep_dim:
         # do this before sending to device to create the initial tensor layouts correctly
         b = b.unsqueeze(dim)
@@ -39,14 +41,18 @@ def run_binary_op(func, device, dtype, dim, compact, reduce_keep_dim, pre_op_kee
     b = b.to(device, dtype)
 
     if device == "cpu":
-        explanation = dynamo.explain(func)(dim, compact, reduce_keep_dim, pre_op_keep_dim, a, b)
+        explanation = dynamo.explain(func)(
+            dim, compact, reduce_keep_dim, pre_op_keep_dim, a, b
+        )
         for i, gm in enumerate(explanation.graphs):
             print(f"\nRepro {i}:\n")
             print("import torch")
             print("device='spyre'")
             print(f"a = torch.ones({tuple(a.shape)}, device=device, {dtype=})")
             print(f"b = torch.ones({tuple(b.shape)}, device=device, {dtype=})")
-            print(f"{filename}_maybe_compact =  lambda x, _: torch.ops.spyre.compact(x)")
+            print(
+                f"{filename}_maybe_compact =  lambda x, _: torch.ops.spyre.compact(x)"
+            )
             print(gm.code)
             print("compiled = torch.compile(forward)")
             print("print(compiled(None, a,b))")
@@ -91,7 +97,7 @@ POINTWISE_CASES = {
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("compact", [True], ids=["compact"])
-#@pytest.mark.parametrize("compact", BOTH, ids=["no_compact", "compact"])
+# @pytest.mark.parametrize("compact", BOTH, ids=["no_compact", "compact"])
 @pytest.mark.parametrize("reduce_keep_dim", BOTH)
 @pytest.mark.parametrize("pre_mul_keep_dim", BOTH)
 @pytest.mark.parametrize(
@@ -106,12 +112,20 @@ def test_pointwise_binary_op(
     reduce_keep_dim: bool,
     pre_mul_keep_dim: bool,
     a: torch.tensor,
-    b: torch.tensor
+    b: torch.tensor,
 ):
-
     def do_run(device):
-        return run_binary_op(mul_on_reduced, device, dtype, dim, compact,
-                             reduce_keep_dim, pre_mul_keep_dim, a, b)
+        return run_binary_op(
+            mul_on_reduced,
+            device,
+            dtype,
+            dim,
+            compact,
+            reduce_keep_dim,
+            pre_mul_keep_dim,
+            a,
+            b,
+        )
 
     run_test(do_run, compact)
 
@@ -137,23 +151,18 @@ MATMUL_CASES = {
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("compact", [True], ids=["compact"])
-#@pytest.mark.parametrize("compact", BOTH, ids=["no_compact", "compact"])
+# @pytest.mark.parametrize("compact", BOTH, ids=["no_compact", "compact"])
 @pytest.mark.parametrize(
     "a,b,dim",
     list(MATMUL_CASES.values()),
     ids=list(MATMUL_CASES.keys()),
 )
 def test_matmul_op(
-    dtype: torch.dtype,
-    compact: bool,
-    dim: int,
-    a: torch.tensor,
-    b: torch.tensor
+    dtype: torch.dtype, compact: bool, dim: int, a: torch.tensor, b: torch.tensor
 ):
-
     def do_run(device):
-        return run_binary_op(matmul_on_reduced, device, dtype, dim, compact,
-                             False, False, a, b)
+        return run_binary_op(
+            matmul_on_reduced, device, dtype, dim, compact, False, False, a, b
+        )
 
     run_test(do_run, compact)
-

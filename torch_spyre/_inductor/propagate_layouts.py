@@ -78,7 +78,6 @@ from .pass_utils import (
     identify_matmul_inputs,
     host_coordinates,
     device_coordinates,
-    is_sparse_stl,
     try_device_coordinates,
     indirect_info_from_op,
     is_stick_expr_offset_free,
@@ -1208,8 +1207,7 @@ def _compact_layout(
     output_dep: MemoryDep,
     args: list[PropArg],
 ) -> list[SpyreTensorLayout]:
-    """Layout for spyre::compact: output is the default dense STL.
-    """
+    """Layout for spyre::compact: output is the default dense STL."""
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
     out_stl = SpyreTensorLayout(

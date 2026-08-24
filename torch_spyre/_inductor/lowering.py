@@ -42,7 +42,7 @@ from .ir import (
     BroadcastAsyncFallback,
     WaitWorkFallback,
 )
-from torch_spyre._C import SpyreTensorLayout, get_elem_in_stick
+from torch_spyre._C import get_elem_in_stick
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from .errors import Unsupported
@@ -1130,6 +1130,7 @@ def lower_compact(x):
 
     pw.realize()
     return pw
+
 
 @register_spyre_lowering(torch.ops.aten.full.default, type_promotion_kind=None)
 def lower_full(size, fill_value, dtype=None, layout=None, device=None, pin_memory=None):

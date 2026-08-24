@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Self, Sequence, Tuple, Union
 from abc import ABC
@@ -1118,7 +1117,9 @@ class SpyreKernel(Kernel[CSEVariable]):
             else:
                 in_coords = args[-2].device_coordinates
                 out_coords = args[-1].device_coordinates
-                if all(e == 0 for e in in_coords) and not all(e == 0 for e in out_coords):
+                if all(e == 0 for e in in_coords) and not all(
+                    e == 0 for e in out_coords
+                ):
                     # Broadcast: scalar input expanding to non-scalar output.
                     op = IDENTITY_OP
                 elif in_coords[-1].free_symbols != out_coords[-1].free_symbols:
@@ -1376,7 +1377,7 @@ def _build_compact_opspec(
         assert not out_is_sparse
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
 
-    op=IDENTITY_OP
+    op = IDENTITY_OP
     if restick:
         in_coords = _reinterpret_coords(
             [int(s) for s in in_stl.device_size],
@@ -1395,25 +1396,25 @@ def _build_compact_opspec(
 
         if len(out_coords) == 2:
             assert out_coords[0] == 0
-            out_coords[-2] = sympy.floor(out_coords[-1]/out_stl.elems_per_stick())
-            out_coords[-1] = sympy.Mod(out_coords[-1],out_stl.elems_per_stick())
+            out_coords[-2] = sympy.floor(out_coords[-1] / out_stl.elems_per_stick())
+            out_coords[-1] = sympy.Mod(out_coords[-1], out_stl.elems_per_stick())
         else:
             assert out_coords[-3] == 0
-            out_coords[-3] = sympy.floor(out_coords[-1]/out_stl.elems_per_stick())
-            out_coords[-1] = sympy.Mod(out_coords[-1],out_stl.elems_per_stick())
+            out_coords[-3] = sympy.floor(out_coords[-1] / out_stl.elems_per_stick())
+            out_coords[-1] = sympy.Mod(out_coords[-1], out_stl.elems_per_stick())
 
-        out_coords.insert(0, sympy.floor(reinterpret_sym/out_stl.elems_per_stick()))
-        template_out.device_size.insert(0,1)
+        out_coords.insert(0, sympy.floor(reinterpret_sym / out_stl.elems_per_stick()))
+        template_out.device_size.insert(0, 1)
 
         assert len(in_stl.stride_map) >= 3
         assert in_stl.stride_map[-1] == -1
         assert in_stl.stride_map[-3] == -1
 
-        in_coords[-3] = sympy.floor(reinterpret_sym/in_stl.elems_per_stick())
-        in_coords[-1] = sympy.Mod(reinterpret_sym,in_stl.elems_per_stick())
+        in_coords[-3] = sympy.floor(reinterpret_sym / in_stl.elems_per_stick())
+        in_coords[-1] = sympy.Mod(reinterpret_sym, in_stl.elems_per_stick())
 
         it_space[reinterpret_sym] = 64
-        op=RESTICKIFY_OP
+        op = RESTICKIFY_OP
     else:
         in_coords = compute_coordinates(
             in_stl.device_size,
