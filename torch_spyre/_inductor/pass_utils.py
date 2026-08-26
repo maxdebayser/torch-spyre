@@ -891,12 +891,18 @@ def identify_matmul_inputs(
     return None, None
 
 
+def _get_range_vars(dep: MemoryDep) -> set[sympy.Symbol]:
+    # Not all free symbols are range vars (symbolic shapes)
+    # and not all range vars appear in the index equation.
+    return set(dep.var_names) & set(dep.index.free_symbols)
+
+
 def find_reduction_var(x_dep: MemoryDep, out_dep: MemoryDep) -> sympy.Symbol:
     """Return the single loop variable that appears in x's index but not in the output's.
 
     Raises Unsupported if the count is not exactly 1.
     """
-    reduction_vars = x_dep.index.free_symbols - out_dep.index.free_symbols
+    reduction_vars = _get_range_vars(x_dep) - _get_range_vars(out_dep)
     if len(reduction_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 reduction variable, got {reduction_vars}"
@@ -913,8 +919,8 @@ def find_matmul_generated_var(
     Raises Unsupported if the count is not exactly 1.
     """
     generated_vars = (
-        y_dep.index.free_symbols & out_dep.index.free_symbols
-    ) - x_dep.index.free_symbols
+        _get_range_vars(y_dep) & _get_range_vars(out_dep)
+    ) - _get_range_vars(x_dep)
     if len(generated_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 generated variable, got {generated_vars}"

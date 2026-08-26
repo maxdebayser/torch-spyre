@@ -225,9 +225,9 @@ def compute_coordinates(
                 # var range intersects dim, add term
                 if next_stride[dim] < concrete_limit:
                     # var range overflows dim
-                    coordinates[dim] += var * step % next_stride[dim] // st
+                    coordinates[dim] += var * concrete_step % next_stride[dim] // st
                 else:
-                    coordinates[dim] += var * step // st
+                    coordinates[dim] += var * concrete_step // st
         # add term for primary dim
         if primary_stride > 0:
             if next_stride[primary_dim] < concrete_limit:
@@ -236,7 +236,7 @@ def compute_coordinates(
                     var * step % next_stride[primary_dim] // primary_stride
                 )
             else:
-                coordinates[primary_dim] += var * step // primary_stride
+                coordinates[primary_dim] += var * concrete_step // primary_stride
 
     vars = index.free_symbols
     offset = index.xreplace({v: 0 for v in vars})
@@ -262,14 +262,13 @@ def compute_coordinates(
                 continue
         else:
             range_val = var_ranges[var]
-
         # Skip vars with trivial range.  For symbolic ranges we cannot
         # statically determine triviality, so we assume they are non-trivial.
         if isinstance(range_val, (int, sympy.Integer)) and int(range_val) <= 1:
             continue
 
         # isolate current var
-        term = index.xreplace({v: 0 for v in vars - {var}})
+        term = index.xreplace({v: 0 for v in var_ranges.keys() - {var}})
 
         if var in repeat_info:
             info = repeat_info[var]
