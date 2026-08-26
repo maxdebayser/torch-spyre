@@ -133,6 +133,10 @@ def _concretize_for_cmp(expr):
     return int(expr)
 
 
+def get_terms_for_var(expr, var):
+    return [term for term in sympy.Add.make_args(expr) if var in term.free_symbols]
+
+
 def compute_coordinates(
     size: Sequence[sympy.Expr],
     stride: Sequence[sympy.Expr],
@@ -268,7 +272,11 @@ def compute_coordinates(
             continue
 
         # isolate current var
-        term = index.xreplace({v: 0 for v in var_ranges.keys() - {var}})
+        global counter
+        terms = get_terms_for_var(index, var)
+        if len(terms) != 1:
+            raise Unsupported(f"variable {var} appears 0 or multiple times in {index}")
+        term = terms[0]
 
         if var in repeat_info:
             info = repeat_info[var]
