@@ -47,6 +47,7 @@ OP_OUTPUT_GOOD_FOR_LX_REUSE = frozenset(
         "maximum",
         "sum",
         "clone",
+        "compact",
         "exp",
         "sub",
         "mul",
