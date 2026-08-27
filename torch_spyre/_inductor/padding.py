@@ -437,7 +437,6 @@ def is_restickify_op(op: Operation, graph: GraphLowering) -> bool:
         return False
     if not isinstance(op.data, Pointwise):
         return False
-
     if _is_compact_node(op):
         return False
 

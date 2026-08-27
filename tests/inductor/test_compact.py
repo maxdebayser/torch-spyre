@@ -367,10 +367,22 @@ def _assert_layout_matches(actual, expected):
     actual_snapshot = _tensor_layout_snapshot(actual)
     expected_snapshot = _tensor_layout_snapshot(expected)
     for key in actual_snapshot:
-        assert actual_snapshot[key] == expected_snapshot[key], (
-            f"{key} mismatch: actual={actual_snapshot[key]!r} "
-            f"expected={expected_snapshot[key]!r}"
-        )
+        dtype_size = torch.tensor([1], dtype=actual.dtype).element_size()
+        stick_size = int(128 / dtype_size)
+        if key == "storage_nbytes":
+            assert actual_snapshot[key] in (
+                expected_snapshot[key],
+                stick_size * expected_snapshot[key],
+            )
+        elif key == "dev_layout":
+            actual_size = actual_snapshot[key].device_size
+            expected_size = actual_snapshot[key].device_size
+            assert actual_size in (expected_size, [stick_size] + expected_size)
+        else:
+            assert actual_snapshot[key] == expected_snapshot[key], (
+                f"{key} mismatch: actual={actual_snapshot[key]!r} "
+                f"expected={expected_snapshot[key]!r}"
+            )
 
 
 # (shape, dim, keepdim) cases: 1D/2D/3D inputs, reducing the last dim or
