@@ -1,5 +1,5 @@
 test_suite_config:
-  labels: [core, full, device_critical]
+  labels: [trunk]
   files:
     - path: ${TORCH_DEVICE_ROOT}/tests/profiler/test_spyre_profiler.py
       unlisted_test_mode: mandatory_success
@@ -19,4 +19,9 @@ test_suite_config:
         - names:
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id_spyre
             - TestMemoryProfilerTimeline::test_memory_timeline_no_id_cpu
+          mode: mandatory_success
+        - names:
+            - test_find_device_overlaps
+            - test_find_device_overlaps_invalid_events
+            - test_kernel_time_overlap
           mode: mandatory_success
