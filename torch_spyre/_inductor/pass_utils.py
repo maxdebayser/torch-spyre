@@ -2003,17 +2003,32 @@ def stick_compatible(coords: "list[list[sympy.Expr]]") -> bool:
     return len(stick_vars) <= 1 and stick_vars.isdisjoint(nonstick_vars)
 
 
-def is_sparse_stl(stl: SpyreTensorLayout) -> bool:
+def is_sparse_stl(stl) -> bool:
     """Return True if stl has the stride_map pattern of a sparse Spyre layout.
 
     A sparse layout is produced by a reduction along the stick dimension:
     the stick dim (device_size[-1] == elems_per_stick) is synthetic with
     stride_map[-1] == -1 (no corresponding host stride).
 
-    Note: this predicate may return True for dense layouts whose host has all
-    size-1 dims (since size-1 dims also carry stride_map == -1).
+    A device tensor has a device_size and stride_map. Remove the dimensions of
+    size one from both lists. The stride of a dimension is the prod of the
+    dimensions to its right. Consider all dimensions whose stride is not a
+    multiple of num_elements_per_stick. A tensor is sparse iff the matching
+    stride_map elements are all less than or equal to zero.
     """
-    return int(stl.stride_map[-1]) == -1
+    dev_stride = 1
+    sparse = False
+    for dev_size, host_stride in zip(
+        reversed(stl.device_size), reversed(stl.stride_map)
+    ):
+        if dev_size != 1:
+            if dev_stride % stl.elems_per_stick() != 0:
+                if host_stride > 0:
+                    return False  # early return
+                else:
+                    sparse = True
+            dev_stride *= dev_size
+    return sparse
 
 
 def _is_compact_node(current_node: ComputedBuffer | SchedulerNode) -> bool:
