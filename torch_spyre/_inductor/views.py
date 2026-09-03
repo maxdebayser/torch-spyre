@@ -202,8 +202,8 @@ def _concretize_for_cmp(expr):
     return int(expr)
 
 
-def get_terms_for_var(expr, var):
-    return [term for term in sympy.Add.make_args(expr) if var in term.free_symbols]
+def get_term_for_var(expr, var):
+    return sum(term for term in sympy.Add.make_args(expr) if var in term.free_symbols)
 
 
 def _decompose_constant_offset(
@@ -393,10 +393,7 @@ def compute_coordinates(
             continue
 
         # isolate current var
-        terms = get_terms_for_var(index, var)
-        if len(terms) != 1:
-            raise Unsupported(f"variable {var} appears 0 or multiple times in {index}")
-        term = terms[0]
+        term = get_term_for_var(index, var)
 
         if var in repeat_info:
             info = repeat_info[var]
