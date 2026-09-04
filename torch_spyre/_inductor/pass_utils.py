@@ -2038,9 +2038,11 @@ def is_sparse_stl(stl) -> bool:
         if dev_size != 1:
             if dev_stride % stl.elems_per_stick() != 0:
                 if host_stride > 0:
-                    return False  # early return
+                    return False
                 else:
                     sparse = True
+            else:
+                break
             dev_stride *= dev_size
     return sparse
 
