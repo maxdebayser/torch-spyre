@@ -986,12 +986,6 @@ def get_matmul_m_size(op: "Operation") -> int:
     return 1
 
 
-def _get_range_vars(dep: MemoryDep) -> set[sympy.Symbol]:
-    # Not all free symbols are range vars (symbolic shapes)
-    # and not all range vars appear in the index equation.
-    return set(dep.var_names) & set(dep.index.free_symbols)
-
-
 def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy.Symbol:
     """Return the single input iteration symbol reduced from the output.
 
@@ -1001,9 +995,9 @@ def find_reduction_var(inputs: Sequence[MemoryDep], out_dep: MemoryDep) -> sympy
     reduction_vars = {
         sym
         for inp in inputs
-        for sym in _get_range_vars(inp)
-        if not is_indirect(sym.name)
-    } - _get_range_vars(out_dep)
+        for sym in inp.index.free_symbols
+        if sym in inp.ranges and not is_indirect(sym.name)
+    } - out_dep.index.free_symbols
     if len(reduction_vars) != 1:
         raise Unsupported(
             f"expected exactly 1 reduction variable, got {reduction_vars}"
@@ -1091,9 +1085,9 @@ def find_matmul_generated_var(
 
     Raises Unsupported if the count is not exactly 1.
     """
-    y_syms = _get_range_vars(y_dep)
-    x_syms = _get_range_vars(x_dep)
-    out_syms = _get_range_vars(out_dep)
+    y_syms = y_dep.index.free_symbols
+    x_syms = x_dep.index.free_symbols
+    out_syms = out_dep.index.free_symbols
     logger.debug(
         "[find_matmul_generated_var] looking for N (generated dim = in y & out, not in x)\n"
         "  x   index=%-20s  free=%s\n"
