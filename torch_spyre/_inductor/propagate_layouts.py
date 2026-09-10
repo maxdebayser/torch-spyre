@@ -274,26 +274,24 @@ def _make_output_stl(
 
 
 def _candidate_output_stls(
-    output: FixedLayout,
+    out_coords,
     output_dep: MemoryDep,
     c_size: list,
     c_stride: list,
     skip_stick_expr: sympy.Expr,
-    dtype=None,
+    dtype,
 ) -> list[SpyreTensorLayout]:
     """Enumerate candidate output STLs by trying each dim as the stick.
 
     Skip the dim that already produces an unsupported stick.
     """
-    out_coords = host_coordinates(output, output_dep, None)
     skip_dim = _pick_stick_dim(skip_stick_expr, out_coords)
 
-    dtype = output.dtype if dtype is None else dtype
     stick_size = get_elem_in_stick(dtype)
     # Prefer stick-aligned dims; fall back to unaligned dims (padded later by
     # insert_restickify_padding) only when no aligned dim yields a candidate.
-    all_dims = [d for d in range(len(output.size)) if d != skip_dim]
-    aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, output.size, stick_size)
+    all_dims = [d for d in range(len(c_size.size)) if d != skip_dim]
+    aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, c_size, stick_size)
     stls: list[SpyreTensorLayout] = []
     for dims in (aligned_dims, unaligned_dims):
         for d in dims:
@@ -612,7 +610,7 @@ def _single_arg_op_layout(
     if out_stl is not None:
         return [out_stl]
     return _candidate_output_stls(
-        output,
+        out_coords,
         output_dep,
         c_size,
         c_stride,
@@ -681,7 +679,7 @@ def _clone_layout(
     in_host_coords = host_coordinates(in_layout, in_dep, None)
     required_in_stl = None
     for candidate in _candidate_output_stls(
-        output, output_dep, c_size, c_stride, stick_expr, dtype_for_layout
+        out_coords, output_dep, c_size, c_stride, stick_expr, dtype_for_layout
     ):
         target_stick = device_coordinates(candidate, output_dep, None)[-1]
         target_stl = compute_restickify_target_layout(
@@ -1965,8 +1963,9 @@ def _find_alt_target_stl(
 
     c_size = [concretize_expr(s) for s in target_layout.size]
     c_stride = [concretize_expr(s) for s in target_layout.stride]
+    target_coords = host_coordinates(target_layout, output_dep, None)
     candidates = _candidate_output_stls(
-        target_layout, output_dep, c_size, c_stride, write_stick, dtype_for_layout
+        target_coords, output_dep, c_size, c_stride, write_stick, dtype_for_layout
     )
     if not candidates:
         raise Unsupported(
