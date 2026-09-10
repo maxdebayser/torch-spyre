@@ -290,7 +290,7 @@ def _candidate_output_stls(
     stick_size = get_elem_in_stick(dtype)
     # Prefer stick-aligned dims; fall back to unaligned dims (padded later by
     # insert_restickify_padding) only when no aligned dim yields a candidate.
-    all_dims = [d for d in range(len(c_size.size)) if d != skip_dim]
+    all_dims = [d for d in range(len(c_size)) if d != skip_dim]
     aligned_dims, unaligned_dims = _dims_by_alignment(all_dims, c_size, stick_size)
     stls: list[SpyreTensorLayout] = []
     for dims in (aligned_dims, unaligned_dims):
