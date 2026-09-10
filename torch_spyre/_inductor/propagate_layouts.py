@@ -233,7 +233,9 @@ def _output_stl_from_stick_expr(
         return None
     out_coords = host_coordinates(output, output_dep, None)
     out_stick_dim = _pick_stick_dim(stick_expr, out_coords)
-    return _make_output_stl(output, output_dep, c_size, c_stride, out_stick_dim, dtype)
+    return _make_output_stl(
+        out_coords, output_dep, c_size, c_stride, out_stick_dim, dtype
+    )
 
 
 def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[int]]:
@@ -254,17 +256,15 @@ def _dims_by_alignment(dims, sizes, stick_size: int) -> tuple[list[int], list[in
 
 
 def _make_output_stl(
-    output, output_dep, c_size, c_stride, stick_dim, dtype=None
+    out_coords, output_dep, c_size, c_stride, stick_dim, dtype
 ) -> SpyreTensorLayout | None:
     """Build a candidate output STL with stick_dim last and verify the resulting stick is offset-free.
 
     Returns None if the resulting stick expression has an offset.
     """
-    dtype = output.dtype if dtype is None else dtype
     stick_size = get_elem_in_stick(dtype)
     if stick_dim >= 0 and c_size[stick_dim] == 1:
         return None
-    out_coords = host_coordinates(output, output_dep, None)
     dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
     stl = SpyreTensorLayout(c_size, c_stride, dtype, dim_order)
     coords = device_coordinates(stl, output_dep, None)
@@ -297,7 +297,7 @@ def _candidate_output_stls(
     stls: list[SpyreTensorLayout] = []
     for dims in (aligned_dims, unaligned_dims):
         for d in dims:
-            stl = _make_output_stl(output, output_dep, c_size, c_stride, d, dtype)
+            stl = _make_output_stl(out_coords, output_dep, c_size, c_stride, d, dtype)
             if stl is not None:
                 stls.append(stl)
         if stls:
@@ -457,7 +457,7 @@ def _single_arg_op_layout(
                     if out_stick_dim < 0:
                         continue
                 out_stl = _make_output_stl(
-                    output,
+                    out_coords,
                     output_dep,
                     c_size,
                     c_stride,
