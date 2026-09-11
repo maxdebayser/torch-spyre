@@ -348,7 +348,7 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
   }
 }
 
-std::vector<int64_t> get_spyre_tensor_dma_sizes(const at::Tensor& tensor) {
+std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone());
   SpyreTensorImpl* impl;
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
@@ -357,7 +357,7 @@ std::vector<int64_t> get_spyre_tensor_dma_sizes(const at::Tensor& tensor) {
   TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorImpl");
 }
 
-std::vector<int64_t> get_spyre_tensor_dma_strides(const at::Tensor& tensor) {
+std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor) {
   TORCH_CHECK(tensor.is_privateuseone());
   SpyreTensorImpl* impl;
   if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {

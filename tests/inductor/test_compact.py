@@ -24,7 +24,7 @@ import torch._dynamo as dynamo
 
 import torch_spyre._inductor.passes as _passes
 from torch._inductor.virtualized import V
-from torch_spyre._C import get_spyre_tensor_dma_sizes, get_spyre_tensor_dma_strides
+from torch_spyre._C import get_spyre_tensor_sizes, get_spyre_tensor_strides
 from utils_inductor import _compile_and_run
 
 DEVICE = torch.device("spyre")
@@ -148,8 +148,8 @@ def _tensor_layout_snapshot(t):
         "contiguous": t.is_contiguous(),
         "device": t.device,
         "dev_layout": t.device_tensor_layout(),
-        "dma_sizes": get_spyre_tensor_dma_sizes(t),
-        "dma_strides": get_spyre_tensor_dma_strides(t),
+        "dma_sizes": get_spyre_tensor_sizes(t),
+        "dma_strides": get_spyre_tensor_strides(t),
     }
 
 
