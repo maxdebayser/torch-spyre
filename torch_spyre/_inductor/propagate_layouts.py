@@ -82,6 +82,7 @@ from .ir import (
 from .pass_utils import (
     compute_restickify_target_layout,
     concretize_expr,
+    expand_sparse,
     find_matmul_generated_var,
     find_reduction_var,
     get_matmul_m_size,
@@ -92,7 +93,6 @@ from .pass_utils import (
     try_device_coordinates,
     indirect_info_from_op,
     is_keep_by_index,
-    is_sparse_stl,
     is_stick_expr_offset_free,
     is_topk,
     iter_var_id,
@@ -1479,17 +1479,28 @@ def _multi_arg_pointwise_layouts(
     c_stride = [concretize_expr(s) for s in output.stride]
 
     def _is_supported_layout(dim_order):
-        for arg in args:
-            # Project output dim_order to input, dropping leading dims missing due to broadcast.
-            rank_diff = len(output.size) - len(arg.layout.size)
-            projected_dim_order = [d - rank_diff for d in dim_order if d >= rank_diff]
-            c_in_size = [concretize_expr(s) for s in arg.layout.size]
-            c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+        for arg, in_coord in zip(args, in_coords):
+            surviving_dims = [
+                i
+                for i, c in enumerate(in_coord)
+                if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
+            ]
+            c_in_size = [
+                concretize_expr(s)
+                for i, s in enumerate(arg.layout.size)
+                if i in surviving_dims
+            ]
+            c_in_stride = [
+                concretize_expr(s)
+                for i, s in enumerate(arg.layout.stride)
+                if i in surviving_dims
+            ]
+
             in_stl = SpyreTensorLayout(
                 c_in_size,
                 c_in_stride,
                 out_dtype_for_layout,
-                projected_dim_order,
+                list(range(len(c_in_size))),
                 output_ea,
             )
             coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
@@ -1506,6 +1517,8 @@ def _multi_arg_pointwise_layouts(
                         return False
         return True
 
+    results: list[SpyreTensorLayout] = []
+
     def _try_stick_dim(stick_dim):
         dim_order = _compute_dim_order(stick_dim, c_size, out_coords)
         if _is_supported_layout(dim_order):
@@ -1514,8 +1527,6 @@ def _multi_arg_pointwise_layouts(
                     c_size, c_stride, out_dtype_for_layout, dim_order, output_ea
                 )
             )
-
-    results: list[SpyreTensorLayout] = []
 
     if can_use_same_layout:
         template_stl = next(iter(args[0].layouts))
@@ -1698,28 +1709,10 @@ def _compact_layout(
     out_layouts = []
 
     for in_stl in in_arg.layouts:
-        c_size = [concretize_expr(s) for s in output.size]
-        c_stride = [concretize_expr(s) for s in output.stride]
-
-        out_stl = SpyreTensorLayout(
-            c_size, c_stride, output.dtype, list(range(len(output.size)))
+        _, out_stl = expand_sparse(
+            in_stl,
+            output,
         )
-
-        in_is_sparse = is_sparse_stl(in_stl)
-        out_is_sparse = is_sparse_stl(out_stl)
-
-        if not in_is_sparse:
-            assert not out_is_sparse
-
-        restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
-
-        if restick:
-            out_stl = SpyreTensorLayout(
-                [in_stl.elems_per_stick()] + out_stl.device_size,
-                [c_stride[0] * c_size[0]] + out_stl.stride_map,
-                out_stl.device_dtype,
-            )
-
         out_layouts.append(out_stl)
 
     op.restick_cost_fn = AnyInNode.from_args()
