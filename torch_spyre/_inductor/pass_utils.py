@@ -2284,9 +2284,6 @@ def expand_sparse(
     in_is_sparse = is_sparse_stl(in_stl)
     out_is_sparse = is_sparse_stl(out_stl)
 
-    if not in_is_sparse:
-        assert not out_is_sparse
-
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
 
     if restick:
