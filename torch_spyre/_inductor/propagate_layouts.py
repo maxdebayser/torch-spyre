@@ -1549,27 +1549,31 @@ def _multi_arg_pointwise_layouts(
 
     def _is_supported_layout(dim_order):
         for arg, in_coord in zip(args, in_coords):
-            surviving_dims = [
-                i
-                for i, c in enumerate(in_coord)
-                if len(c.free_symbols) > 0 and matching_dim(out_coords, c) is not None
-            ]
-            c_in_size = [
-                concretize_expr(s)
-                for i, s in enumerate(arg.layout.size)
-                if i in surviving_dims
-            ]
-            c_in_stride = [
-                concretize_expr(s)
-                for i, s in enumerate(arg.layout.stride)
-                if i in surviving_dims
-            ]
+            n_dims = len(dim_order)
+            c_in_size = [concretize_expr(s) for s in arg.layout.size]
+            c_in_stride = [concretize_expr(s) for s in arg.layout.stride]
+            if len(c_in_size) < n_dims and dim_order[-1] == -1:
+                c_in_size.append(0)
+                c_in_stride.append(0)
 
+            # Project output dim_order to input, dropping leading dims missing due to broadcast.
+            rank_diff = len(output.size) - len(arg.layout.size)
+            projected_dim_order = []
+            for i, d in enumerate(dim_order):
+                if d >= rank_diff:
+                    projected_dim_order.append(d - rank_diff)
+                elif d == -1:
+                    projected_dim_order.append(-1)
+
+            c_in_size = c_in_size[-n_dims:]
+            c_in_stride = c_in_stride[-n_dims:]
+
+            assert len(c_in_size) == len(projected_dim_order)
             in_stl = SpyreTensorLayout(
                 c_in_size,
                 c_in_stride,
                 out_dtype_for_layout,
-                list(range(len(c_in_size))),
+                projected_dim_order,
                 output_ea,
             )
             coord = try_device_coordinates(in_stl, arg.dep, ind_sizes)
