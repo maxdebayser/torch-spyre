@@ -2420,7 +2420,23 @@ def compute_restickify_needed(
             red_var = min(reduction_vars, key=str)
             target_stick = sympy.Mod(red_var, in_stl.elems_per_stick())
 
-    expanded, expanded_stl = expand_sparse(in_stl, out_host)
+    # We want to test whether a sparse to dense conversion is possible.
+    # But if there is a trailing 1 dim, the STL will create a sparse layout
+    # defeating the test.
+    dense_in_host = FixedLayout(
+        device=in_host.device,
+        dtype=in_host.dtype,
+        size=in_host.size[:],
+        stride=in_host.stride[:],
+        offset=in_host.offset,
+        is_pinned=in_host.is_pinned,
+    )
+    while len(dense_in_host._size) > 1 and dense_in_host._size[-1] == 1:
+        dense_in_host._size.pop(-1)
+        dense_in_host._stride.pop(-1)
+    # Here we test the dense_in_host instead of out_host because out_host might
+    # have extra dimensions in which the input will be broadcasted into.
+    expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)
     if expanded:
         return True, expanded_stl
 
