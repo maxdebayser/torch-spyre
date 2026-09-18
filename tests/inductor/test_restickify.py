@@ -57,7 +57,7 @@ def _seed_rng():
 def _compute_cost(restickify_plan):
     assert restickify_plan is not None, "restickify_plan should not be None"
     return sum(
-        math.prod(int(s) for s in entry["target_layout"].size)
+        math.prod(int(s) for s in entry.target_layout.size)
         for entries in restickify_plan.values()
         for entry in entries
     )
