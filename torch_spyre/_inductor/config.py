@@ -104,12 +104,13 @@ lx_solver_relayout_groups_per_edge: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE", "4")
 )
 
-# Above this many relayout copies in one CP-SAT solve, run the solver without
-# its presolve. One of CP-SAT's presolve passes scales super-linearly in the
-# number of free copy residency literals (measured on the spyre_attn decode
+# For unpriced CP-SAT solves, skip presolve above this many relayout copies.
+# Priced relayout solves already skip it regardless of count. One of CP-SAT's
+# presolve passes scales super-linearly in the number of free copy residency
+# literals (measured on the spyre_attn decode
 # graph: 16 copies 5 s, 64 copies 13 s, 160 copies 40 s, 312 copies past the
 # 120 s limit) and no exposed parameter shortens it, while search on the raw
-# model finds a feasible plan within seconds. 0 never skips presolve.
+# model finds a feasible plan within seconds. 0 disables this count threshold.
 lx_solver_relayout_presolve_max_copies: int = int(
     os.getenv("SPYRE_LX_SOLVER_RELAYOUT_PRESOLVE_MAX_COPIES", "64")
 )
@@ -197,6 +198,11 @@ timing_out: str = os.environ.get("TORCH_SPYRE_TIMING_OUT", "")
 # spellings, so one value drives this pass and that older per-op dump together.
 # Tests override with config.patch({"cost_model": "1"}) rather than the environment.
 cost_model: str = os.environ.get("SPYRE_DUMP_COST", "")
+# Append one JSON record per co-optimized graph to this file: the symbolic cost
+# objective the solver minimized (per-bundle terms and relayout charges as sympy
+# ``srepr`` strings), the symbol values the solve chose, and each term evaluated
+# under them. Read by the summarize-sdsc skill. Empty = off.
+dump_cost_expr_file: str = os.environ.get("SPYRE_DUMP_COST_EXPR_FILE", "")
 
 # Disable compiler-generated span-overflow coarse-tiling hints.  The global
 # SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
