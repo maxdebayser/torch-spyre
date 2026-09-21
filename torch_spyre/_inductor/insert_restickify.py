@@ -26,7 +26,6 @@ from .errors import Unsupported
 from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import redirect_computed_buffer_reads
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -465,14 +464,6 @@ def insert_restickify_on_node_inputs(
             return _orig(*args)
 
     object.__setattr__(op.data, "inner_fn", new_inner_fn)
-
-    redirect_computed_buffer_reads(
-        op,
-        {},
-        operations,
-        pass_name="insert_restickify",
-        reason="redirect consumer to restickified input",
-    )
 
 
 def insert_restickify(graph: GraphLowering) -> None:
