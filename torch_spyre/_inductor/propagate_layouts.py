@@ -1795,7 +1795,7 @@ def _compact_layout(
     out_layouts = []
 
     for in_stl in in_arg.layouts:
-        _, out_stl = expand_sparse(in_stl, output, forbid_dense_to_sparse=True)
+        _, out_stl = expand_sparse(in_stl, output)
         out_layouts.append(out_stl)
 
     op.restick_cost_fn = AnyInNode.from_args()
