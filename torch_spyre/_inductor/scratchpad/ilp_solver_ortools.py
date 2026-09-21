@@ -1072,11 +1072,45 @@ class _SympyExprToCpSat(Printer):
         assert lb <= ub
         return lb, ub
 
+    def _lin_max_operand(self, arg):
+        """``arg`` as a ``lin_max`` operand: a constant or a single (affine)
+        variable as is, a sum over several variables behind its own IntVar
+        tied to it by a linear equality.
+
+        Presolve reasons about a ``lin_max`` operand through its exact
+        reachable domain. For a weighted sum of Booleans -- the HBM read and
+        write totals behind the cost model's ``alpha * min(R, W)`` turnaround
+        term sum ``bytes * (1 - is_lx)`` over a bundle's arguments -- that is
+        the set of its subset sums, exponential in the number of distinct
+        coefficients. On a Granite 4.0 decode block it was 4 s of
+        ``PresolveToFixPoint`` (99% of the solve, on 1209 constraints) that
+        neither probing, symmetry nor presolve-iteration limits shorten, and
+        with presolve off it made the LNS
+        workers, whose neighbourhood solves presolve, run out of memory. Behind
+        an IntVar with interval bounds the same operand costs nothing and the
+        optimum is unchanged. Float-coefficient operands pass through as
+        before (``AddMaxEquality`` rejects them and ``_minimize_cost_expr``
+        falls back)."""
+        if isinstance(arg, (int, float)):
+            return arg
+        try:
+            if len(cp_model.FlatIntExpr(arg).vars) <= 1:
+                return arg
+        except TypeError:
+            return arg
+        var = self._model.new_int_var(
+            *self._affine_bounds(arg), f"minmax_arg_{self._count}"
+        )
+        self._count += 1
+        self._model.add(var == arg)
+        return var
+
     def _print_Max(self, expr):
         # max range is (max(mins), max(maxes))
         args = [self._print(arg) for arg in expr.args]
         if all(isinstance(a, (int, float)) for a in args):
             return max(args)  # a lazy Max of constants was never folded
+        args = [self._lin_max_operand(arg) for arg in args]
         bounds = map(max, zip(*[self._affine_bounds(arg) for arg in args]))
         max_var = self._model.new_int_var(*bounds, f"max_var_{self._count}")
         self._model.AddMaxEquality(max_var, args)
@@ -1088,6 +1122,7 @@ class _SympyExprToCpSat(Printer):
         args = [self._print(arg) for arg in expr.args]
         if all(isinstance(a, (int, float)) for a in args):
             return min(args)  # a lazy Min of constants was never folded
+        args = [self._lin_max_operand(arg) for arg in args]
         bounds = map(min, zip(*[self._affine_bounds(arg) for arg in args]))
         min_var = self._model.new_int_var(*bounds, f"min_var_{self._count}")
         self._model.AddMinEquality(min_var, args)
@@ -1110,7 +1145,7 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         buffers: Sequence[LifetimeBoundBuffer],
         size: int,
         alignment: int = 128,
-        time_limit_seconds: float = 120.0,
+        time_limit_seconds: Optional[float] = None,
         bottom_justify: bool = True,
     ) -> None:
         if cp_model is None:
@@ -1123,7 +1158,11 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
         # The solver works in alignment-sized units so every offset it picks is
         # automatically aligned; plan_layout scales sizes/offsets in and out.
         self._capacity_units = self.limit // self.alignment
-        self._time_limit_seconds = time_limit_seconds
+        self._time_limit_seconds = (
+            config.cpsat_time_limit_seconds
+            if time_limit_seconds is None
+            else time_limit_seconds
+        )
         self._bottom_justify = bottom_justify
 
     def plan_layout(self, log_lx_usage: bool = False) -> list[LifetimeBoundBuffer]:
@@ -1269,7 +1308,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(cp_cost)
             status = solver.Solve(model)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                raise SolveError("CP-SAT memory planner found no feasible plan")
+                raise SolveError(
+                    f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                    f"after {solver.WallTime():.2f}s"
+                )
             return status
         except (RuntimeError, TypeError, ValueError) as exc:
             logger.warning(
@@ -1359,7 +1401,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(sum(hbm_terms))
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                    raise SolveError(
+                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                        f"after {solver.WallTime():.2f}s"
+                    )
                 # Lock in the residency optimum (the traffic value, not just the
                 # count) so the parallelism step can never trade a spill for
                 # parallelism. Rounding avoids loss of precision as the objective is
@@ -1383,7 +1428,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.maximize(sum(core_terms))
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                    raise SolveError(
+                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                        f"after {solver.WallTime():.2f}s"
+                    )
                 occupancy = round(solver.ObjectiveValue())
 
                 # Shape balance: holding the parallelism optimum (the objective is
@@ -1396,7 +1444,10 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 model.minimize(sum(core_cost_terms))
                 status = solver.Solve(model)
                 if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                    raise SolveError("CP-SAT memory planner found no feasible plan")
+                    raise SolveError(
+                        f"CP-SAT returned {solver.StatusName(status)} without a plan "
+                        f"after {solver.WallTime():.2f}s"
+                    )
 
         final_tensors = self._extract(solver, tensors)
 
