@@ -232,7 +232,7 @@ _TOLERANCES = {
 
 
 def _ones(*args):
-    return torch.rand(args)
+    return torch.ones(args)
 
 
 # Allow in graph for debugging purposes

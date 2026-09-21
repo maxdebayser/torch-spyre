@@ -2271,8 +2271,7 @@ def _is_compact_node(current_node: ComputedBuffer | SchedulerNode) -> bool:
 
 
 def expand_sparse(
-    in_stl,
-    output: FixedLayout,
+    in_stl, output: FixedLayout, forbid_dense_to_sparse: bool = False
 ) -> tuple[bool, SpyreTensorLayout]:
     c_size = [concretize_expr(s) for s in output.size]
     c_stride = [concretize_expr(s) for s in output.stride]
@@ -2283,6 +2282,9 @@ def expand_sparse(
 
     in_is_sparse = is_sparse_stl(in_stl)
     out_is_sparse = is_sparse_stl(out_stl)
+
+    if forbid_dense_to_sparse and not in_is_sparse:
+        assert not out_is_sparse
 
     restick = len(in_stl.device_size) > 1 and in_is_sparse and not out_is_sparse
 
@@ -2302,7 +2304,6 @@ def compute_restickify_needed(
     in_host: FixedLayout,
     in_dep: MemoryDep,
     out_stl: SpyreTensorLayout,
-    out_host: FixedLayout,
     out_dep: MemoryDep,
     op: "ComputedBuffer | None" = None,
 ) -> "tuple[bool, SpyreTensorLayout | None]":
@@ -2423,17 +2424,17 @@ def compute_restickify_needed(
     # We want to test whether a sparse to dense conversion is possible.
     # But if there is a trailing 1 dim, the STL will create a sparse layout
     # defeating the test.
+    n_dims = len(in_host.size)
+    while n_dims > 1 and in_host.size[n_dims - 1] == 1:
+        n_dims -= 1
     dense_in_host = FixedLayout(
         device=in_host.device,
         dtype=in_host.dtype,
-        size=in_host.size[:],
-        stride=in_host.stride[:],
+        size=in_host.size[:n_dims],
+        stride=in_host.stride[:n_dims],
         offset=in_host.offset,
         is_pinned=in_host.is_pinned,
     )
-    while len(dense_in_host._size) > 1 and dense_in_host._size[-1] == 1:
-        dense_in_host._size.pop(-1)
-        dense_in_host._stride.pop(-1)
     # Here we test the dense_in_host instead of out_host because out_host might
     # have extra dimensions in which the input will be broadcasted into.
     expanded, expanded_stl = expand_sparse(in_stl, dense_in_host)

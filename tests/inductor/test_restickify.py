@@ -1216,7 +1216,7 @@ def test_sparse_dense_pointwise():
     a = torch.randn((S, S, S), dtype=torch.float16)
     b = torch.randn((S, S), dtype=torch.float16)
 
-    _compare(lambda a, b: a.min(-1)[0] + b, a, b)
+    _compare(lambda a, b: a.min(-1)[0] + b, a, b, optimal_cost=16384)
 
 
 # ------- Restickify padding: strided input raises Unsupported ---------
