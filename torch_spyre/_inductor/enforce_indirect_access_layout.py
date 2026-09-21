@@ -44,7 +44,6 @@ from torch_spyre._C import DataFormats, SpyreTensorLayout
 from .constants import ELIDED_COPY_BACK_ATTR
 from .errors import Unsupported
 from .insert_restickify import (
-    arg_dep_index,
     _create_restickify_node,
     _fixed_tiled,
     insert_restickify_on_node_inputs,
@@ -277,15 +276,12 @@ def _insert_relayout_copy(
     operations = graph.operations
     arg_name = value_buf.get_name()
     consumer_name = consumer_op.get_name()
-    mem_deps = [
-        d for d in consumer_op.get_read_writes().reads if isinstance(d, MemoryDep)
-    ]
     insert_restickify_on_node_inputs(
         consumer_op,
         [
             RestickifyArgInfo(
                 arg_name=arg_name,
-                dep_index=arg_dep_index(arg_name, mem_deps),
+                dep_index=None,
                 occurrence=0,
                 target_layout=required_layout,
             )
@@ -610,13 +606,10 @@ def _insert_mutation_relayout_copy(
     orig_stl_layout = target_layout
 
     # Step 1: copy-in: target (current layout) -> buf_tmp (required_stl).
-    mutation_deps = [
-        d for d in mutation_op.get_read_writes().reads if isinstance(d, MemoryDep)
-    ]
     _, buf_tmp = _create_restickify_node(
         RestickifyArgInfo(
             arg_name=target_name,
-            dep_index=arg_dep_index(target_name, mutation_deps),
+            dep_index=None,
             occurrence=0,
             target_layout=buf_tmp_layout,
         ),
@@ -646,13 +639,10 @@ def _insert_mutation_relayout_copy(
     buf_copyback_layout = _fixed_tiled(target_layout, required_stl)
     # For scatter, use buf_tmp as metadata source to avoid inheriting index tensor dependency
     copyback_metadata_op = buf_tmp if is_scatter_op else mutation_op
-    buf_tmp_deps = [
-        d for d in buf_tmp.get_read_writes().reads if isinstance(d, MemoryDep)
-    ]
     _, buf_copyback = _create_restickify_node(
         RestickifyArgInfo(
             arg_name=buf_tmp_name,
-            dep_index=arg_dep_index(buf_tmp_name, buf_tmp_deps),
+            dep_index=None,
             occurrence=0,
             target_layout=buf_copyback_layout,
         ),

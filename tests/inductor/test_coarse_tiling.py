@@ -6384,6 +6384,36 @@ class TestPointSpliceAdvance(unittest.TestCase):
             1,
         )
 
+    def test_legacy_restickify_metadata_rejects_ambiguous_name(self):
+        from torch_spyre._inductor.insert_restickify import (
+            _restickify_dep_index,
+            RestickifyArgInfo,
+        )
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.ir import FixedTiledLayout
+
+        dummy_layout = FixedTiledLayout(
+            torch.device("cpu"),
+            torch.float16,
+            [Integer(1)],
+            [Integer(1)],
+            SpyreTensorLayout([1], torch.float16),
+        )
+
+        u0 = sympy.Symbol("u0", integer=True)
+        deps = [self._dep(32 * u0), self._dep(32 * u0 + 1)]
+
+        with self.assertRaisesRegex(AssertionError, "matches multiple reads"):
+            _restickify_dep_index(
+                deps,
+                RestickifyArgInfo(
+                    arg_name="block_table",
+                    dep_index=None,
+                    occurrence=0,
+                    target_layout=dummy_layout,
+                ),
+            )
+
     def test_restickify_metadata_rejects_missing_exact_dependency(self):
         from torch_spyre._inductor.insert_restickify import (
             _restickify_dep_index,

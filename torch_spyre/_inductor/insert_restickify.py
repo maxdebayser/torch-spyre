@@ -57,22 +57,9 @@ logger = get_inductor_logger("insert_restickify")
 @dataclass
 class RestickifyArgInfo:
     arg_name: str
-    dep_index: sympy.Expr
+    dep_index: sympy.Expr | None
     occurrence: int
     target_layout: FixedTiledLayout
-
-
-def arg_dep_index(arg_name: str, memory_deps: list[MemoryDep]) -> sympy.Expr:
-    matches = [sympy.sympify(dep.index) for dep in memory_deps if dep.name == arg_name]
-    if len(matches) > 1:
-        raise AssertionError(
-            f"legacy restickify entry for {arg_name!r} matches multiple reads"
-        )
-    if not matches:
-        raise AssertionError(
-            f"legacy restickify entry for {arg_name!r} matches no reads"
-        )
-    return matches[0]
 
 
 def _restickify_dep_index(
@@ -80,6 +67,13 @@ def _restickify_dep_index(
 ) -> int | None:
     """Resolve a restickify plan entry to its exact read-metadata slot."""
     old_name = restick_arg_info.arg_name
+    if not restick_arg_info.dep_index:
+        matches = [i for i, dep in enumerate(memory_deps) if dep.name == old_name]
+        if len(matches) > 1:
+            raise AssertionError(
+                f"legacy restickify entry for {old_name!r} matches multiple reads"
+            )
+        return matches[0] if matches else None
 
     expected_index = sympy.sympify(restick_arg_info.dep_index)
     matches = [
@@ -115,11 +109,12 @@ class InputEdgeSwapHandler(WrapperHandler):
     in dep.index, built positionally from inner_fn_args() at wrap time.
     """
 
-    def __init__(self, inner, swaps, index_replacements=None):
+    def __init__(self, inner, swaps, name_map=None, index_replacements=None):
         super().__init__(inner)
         self._swaps_by_name: dict = defaultdict(list)
         for old_name, dep_index, occurrence, new_name in swaps:
             self._swaps_by_name[old_name].append((dep_index, occurrence, new_name))
+        self._name_map = {} if name_map is None else name_map
         self._index_replacements = (
             {} if index_replacements is None else index_replacements
         )
@@ -135,7 +130,7 @@ class InputEdgeSwapHandler(WrapperHandler):
             if expected_index == dep_index
         ]
         if not matching:
-            return super().load(name, index)
+            return super().load(self._name_map.get(name, name), index)
         signature = (name, dep_index)
         occurrence = self._seen[signature]
         self._seen[signature] += 1
@@ -161,7 +156,7 @@ class InputEdgeSwapHandler(WrapperHandler):
             min_planned = min(exp for exp, _ in matching)
             if occurrence < min_planned:
                 # Gap: this occurrence precedes the first restickify — stay original.
-                return super().load(name, index)
+                return super().load(self._name_map.get(name, name), index)
             unique_targets = {new_name for _, new_name in matching}
             assert len(unique_targets) == 1, (
                 f"ambiguous fallback for load {name}[{index}] occurrence {occurrence}: "
@@ -311,6 +306,7 @@ def insert_restickify_on_node_inputs(
     invalidate its sizes cache.
     """
     edge_swaps: list[tuple] = []
+    name_map: dict[str, str] = {}
     try:
         op_index = operations.index(op)
     except ValueError:
@@ -321,14 +317,17 @@ def insert_restickify_on_node_inputs(
     for restick_arg_info in resticks_needed:
         old_name, restick_buff = _create_restickify_node(restick_arg_info, op)
         new_name = restick_buff.get_name()
-        edge_swaps.append(
-            (
-                old_name,
-                restick_arg_info.dep_index,
-                restick_arg_info.occurrence,
-                new_name,
+        if restick_arg_info.dep_index is not None:
+            edge_swaps.append(
+                (
+                    old_name,
+                    restick_arg_info.dep_index,
+                    restick_arg_info.occurrence,
+                    new_name,
+                )
             )
-        )
+        else:
+            name_map[old_name] = new_name
 
         # lower_restickify calls pw.realize() which appends restick_buff to operations.
         # Move it to just before the consumer op to preserve topological order.
@@ -438,6 +437,7 @@ def insert_restickify_on_node_inputs(
     def new_inner_fn(
         *args,
         _swaps=edge_swaps,
+        _map=name_map,
         _orig=orig_inner,
         _canonical=canonical_args,
     ):
@@ -457,7 +457,9 @@ def insert_restickify_on_node_inputs(
                 assert previous == canonical, (
                     f"live inner_fn index maps to multiple canonical indices: {actual} -> {previous}, {canonical}"
                 )
-        with V.set_ops_handler(InputEdgeSwapHandler(V.ops, _swaps, index_replacements)):
+        with V.set_ops_handler(
+            InputEdgeSwapHandler(V.ops, _swaps, _map, index_replacements)
+        ):
             return _orig(*args)
 
     object.__setattr__(op.data, "inner_fn", new_inner_fn)
@@ -831,13 +833,10 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         # Step 1: create restickify node: arg0_1 (orig_stl) -> buf_tmp (alt_stl)
         # This op must read arg0_1 as orig_stl, so record that override on buf_tmp.
         orig_stl_layout = _fixed_tiled(base_layout, orig_stl)
-        mutation_deps = [
-            d for d in mutation_op.get_read_writes().reads if isinstance(d, MemoryDep)
-        ]
         _, buf_tmp = _create_restickify_node(
             RestickifyArgInfo(
                 arg_name=target_name,
-                dep_index=arg_dep_index(target_name, mutation_deps),
+                dep_index=None,
                 occurrence=0,
                 target_layout=buf_tmp_layout,
             ),
@@ -874,13 +873,10 @@ def insert_post_mutation_restickify(graph: GraphLowering) -> None:
         # Since the input and output STLs are the same, this reduces to an identity copy
         # in the later codegen pass. MutationLayoutSHOULDREMOVE(arg0_1) makes this write
         # back to arg0_1's original storage and keeps the copy-back path live.
-        buf_tmp_deps = [
-            d for d in buf_tmp.get_read_writes().reads if isinstance(d, MemoryDep)
-        ]
         _, buf_copyback = _create_restickify_node(
             RestickifyArgInfo(
                 arg_name=buf_tmp_name,
-                dep_index=arg_dep_index(buf_tmp_name, buf_tmp_deps),
+                dep_index=None,
                 occurrence=0,
                 target_layout=buf_copyback_layout,
             ),
