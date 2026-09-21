@@ -67,7 +67,7 @@ def _restickify_dep_index(
 ) -> int | None:
     """Resolve a restickify plan entry to its exact read-metadata slot."""
     old_name = restick_arg_info.arg_name
-    if not restick_arg_info.dep_index:
+    if restick_arg_info.dep_index is None:
         matches = [i for i, dep in enumerate(memory_deps) if dep.name == old_name]
         if len(matches) > 1:
             raise AssertionError(
