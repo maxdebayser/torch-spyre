@@ -173,6 +173,11 @@ def _body_fx_carry_is_passthrough(while_op: "ir.WhileLoop", carry_index: int) ->
     module = getattr(body_graph, "module", None)
     fx_graph = getattr(module, "graph", None)
     if fx_graph is None:
+        logger.debug(
+            "cannot inspect FX pass-through identity for carry %d: "
+            "body_subgraph.graph.module.graph is unavailable",
+            carry_index,
+        )
         return False
 
     placeholders = [node for node in fx_graph.nodes if node.op == "placeholder"]
