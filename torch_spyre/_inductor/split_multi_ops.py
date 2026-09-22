@@ -854,7 +854,7 @@ def split_multi_ops(graph: GraphLowering):
         # Skip if no FX graph origin node in the current (sub)graph. A buffer
         # lowered inside an invoke_subgraph HOP carries origins from both the
         # parent graph and the subgraph; only the subgraph-local origin is a
-        # valid inserting_before anchor here. _origin_in_graph already enforces
+        # valid inserting_before anchor here. origin_in_graph already enforces
         # node-ness and current-graph membership.
         orig_node = origin_in_graph(op.origins, gl.graph)
         if orig_node is None:
