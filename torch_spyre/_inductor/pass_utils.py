@@ -588,7 +588,6 @@ def find_fx_node(arg_name: str, graph_lowering: GraphLowering) -> torch.fx.Node 
     the IR level after FX lowering completed and so has no FX-graph
     counterpart at all.
     """
-    graph_lowering = V.graph
     candidates = [
         fx_node
         for fx_node, tb in graph_lowering.env.items()
