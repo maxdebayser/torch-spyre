@@ -80,6 +80,7 @@ from .pass_utils import (
     is_restickify_coords,
     _is_compact_node,
     lower_pad_sequence,
+    patch_env,
     redirect_computed_buffer_reads,
     replace_computed_buffer_body,
 )
@@ -343,6 +344,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             y_k_dim = y_host_k_dim
         y_padded_size = list(y_size)
         y_padded_size[y_k_dim] = k_padded
+        patch_env(V.graph)
         y_fx_node = find_fx_node(y_name, V.graph)
 
         # No orig_stl: this pass runs before stickification, so the new ops keep
@@ -919,6 +921,7 @@ def _pad_restickify_input(op: Operation, graph: GraphLowering) -> None:
         device = in_buf.get_device()
         if device is None:
             return
+        patch_env(V.graph)
         in_fx_node = find_fx_node(in_dep.name, V.graph)
         if in_fx_node is None:
             raise RuntimeError(f"no FX node found for buffer {in_dep.name!r}")
