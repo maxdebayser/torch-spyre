@@ -616,31 +616,30 @@ def _pad_restickify_output(op: Operation, graph: GraphLowering) -> None:
     )
 
 
-def _compute_digits(coord, ranges) -> tuple[bool, list[tuple[int, sympy.Symbol]]]:
-    digits: list[tuple[int, sympy.Symbol]] = []
+def _compute_digits(coord, ranges) -> list[tuple[int, sympy.Symbol]]:
     syms = coord.free_symbols
     if len(syms) < 2:
-        return False, digits
+        return []
 
     residual = sympy.expand(coord)
-
+    digits: list[tuple[int, sympy.Symbol]] = []
     for sym in syms:
         if sym not in ranges:
-            return False, digits
+            return []
         coeff_expr = residual.coeff(sym)
         if coeff_expr.free_symbols or coeff_expr.is_integer is not True:
-            return False, digits
+            return []
         coeff = concretize_expr(coeff_expr)
         if coeff <= 0:
-            return False, digits
+            return []
         digits.append((coeff, sym))
         residual -= coeff_expr * sym
 
     # A numeric constant is a slice offset and does not change contiguity.
     if residual.free_symbols or not residual.is_number:
-        return False, digits
+        return []
 
-    return True, sorted(digits, key=lambda item: item[0])
+    return sorted(digits, key=lambda item: item[0])
 
 
 def _is_dense_flattened_coordinate(digits, ranges) -> bool:
@@ -657,6 +656,8 @@ def _is_dense_flattened_coordinate(digits, ranges) -> bool:
     Reject nonlinear expressions and gapped or overlapping flattenings.  They need
     the same re-base copy as an ordinary strided input.
     """
+    if not digits:
+        return False
     expected = 1
     for coeff, sym in digits:
         if coeff != expected:
@@ -676,6 +677,8 @@ def _is_nonoverlapping_aligned_stick_coordinate(
     unit-stride and every outer coefficient leaves enough room for the padded
     span of all lower-order symbols.
     """
+    if not digits:
+        return False
     syms = coord.free_symbols
     if stick_sym not in syms:
         return False
@@ -718,20 +721,16 @@ def _restickify_input_required_extent(coord, ranges, stick_sym, dtype) -> int:
             concretize_expr(ranges[stick_sym]), dtype
         )
 
-    err_msg = (
-        f"insert_restickify_padding: input coordinate {coord} is not a "
-        "dense flattening or a set of non-overlapping stick windows"
-    )
-
-    valid_expr, digits = _compute_digits(coord, ranges)
-    if not valid_expr:
-        raise Unsupported(err_msg)
+    digits = _compute_digits(coord, ranges)
     is_dense = _is_dense_flattened_coordinate(digits, ranges)
     has_disjoint_stick_windows = _is_nonoverlapping_aligned_stick_coordinate(
         digits, coord, ranges, stick_sym, dtype
     )
     if not is_dense and not has_disjoint_stick_windows:
-        raise Unsupported(err_msg)
+        raise Unsupported(
+            f"insert_restickify_padding: input coordinate {coord} is not a "
+            "dense flattening or a set of non-overlapping stick windows"
+        )
 
     stick_extent = concretize_expr(ranges[stick_sym])
     if not has_disjoint_stick_windows:
@@ -768,12 +767,11 @@ def _assert_input_paddable(
         if not syms:  # degenerate size-1 host dim, nothing to slice
             continue
         if len(syms) > 1:
-            valid_expr, digits = _compute_digits(coord, in_dep.ranges)
-            if valid_expr and (
-                _is_dense_flattened_coordinate(digits, in_dep.ranges)
-                or _is_nonoverlapping_aligned_stick_coordinate(
-                    digits, coord, in_dep.ranges, out_stick_sym, in_layout.dtype
-                )
+            digits = _compute_digits(coord, in_dep.ranges)
+            if _is_dense_flattened_coordinate(
+                digits, in_dep.ranges
+            ) or _is_nonoverlapping_aligned_stick_coordinate(
+                digits, coord, in_dep.ranges, out_stick_sym, in_layout.dtype
             ):
                 continue
             raise Unsupported(
