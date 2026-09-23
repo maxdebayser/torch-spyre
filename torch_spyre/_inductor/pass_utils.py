@@ -567,6 +567,9 @@ def patch_env(gl: GraphLowering):
             if tb.data.origins:
                 fx_node = origin_in_graph(tb.data.origins, gl.graph)
                 if fx_node is None:
+                    # This fallback is OK because before refactoring, getting
+                    # the first node regardless of origin was the norm in all
+                    # but one call sites.
                     fx_node = next(iter(tb.data.origins))
                 env[fx_node] = tb
     gl.env.update(env)

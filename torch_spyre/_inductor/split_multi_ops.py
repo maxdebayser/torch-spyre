@@ -14,7 +14,6 @@
 
 import collections
 import dataclasses
-from typing import TypeVar
 import sympy
 import torch
 import torch.fx as fx
@@ -466,14 +465,6 @@ def _lower_fx_node(node, gl, ops, idx):
     return buf
 
 
-T = TypeVar("T")
-
-
-def assert_not_none(value: T | None) -> T:
-    assert value is not None
-    return value
-
-
 def _make_intermediate_bufs(
     intermediate_ops,
     vid_to_dtype,
@@ -572,9 +563,12 @@ def _make_intermediate_bufs(
             insert_idx += 1
             continue
 
-        input_nodes = [
-            assert_not_none(find_fx_node(vid_to_bufname[v], gl)) for v in inputs
-        ]
+        def assert_fx_node(v):
+            if (_node := find_fx_node(vid_to_bufname[v], gl)) is not None:
+                return _node
+            raise KeyError(f"No FX node for {vid_to_bufname[v]}")
+
+        input_nodes = [assert_fx_node(v) for v in inputs]
         target = _resolve_fx_target(op_name)
         if target is None:
             raise RuntimeError(f"Cannot resolve target for '{op_name}'")
