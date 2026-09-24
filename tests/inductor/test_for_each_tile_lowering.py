@@ -166,6 +166,47 @@ class TestCarryBindingsFor(unittest.TestCase):
         self.assertEqual(bindings, [])
 
 
+class TestIndirectIndexStepGuard(unittest.TestCase):
+    """_check_indirect_index_step refuses a sub-stick per-trip index advance."""
+
+    def _arg(self, expr):
+        from torch_spyre._C import DataFormats
+        from torch_spyre._inductor.op_spec import TensorArg
+
+        return TensorArg(
+            is_input=True,
+            arg_index=1,
+            device_dtype=DataFormats.SENUINT32,
+            device_size=[4],
+            device_coordinates=[],
+            allocation={},
+            device_tile_advance_expr=expr,
+        )
+
+    def test_sub_stick_step_is_refused(self):
+        import sympy
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+        from torch_spyre._inductor.views import UnalignedStickSplit
+
+        level = sympy.Symbol("L0")
+        with self.assertRaises(UnalignedStickSplit):
+            SpyreKernel._check_indirect_index_step(None, self._arg(2 * level))
+
+    def test_whole_stick_step_is_allowed(self):
+        import sympy
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        level = sympy.Symbol("L0")
+        # B's [trips, 32] rows: one int32 stick; C's one-stick-per-entry: 32*E.
+        SpyreKernel._check_indirect_index_step(None, self._arg(32 * level))
+        SpyreKernel._check_indirect_index_step(None, self._arg(96 * level))
+
+    def test_no_advance_is_allowed(self):
+        from torch_spyre._inductor.spyre_kernel import SpyreKernel
+
+        SpyreKernel._check_indirect_index_step(None, self._arg(None))
+
+
 class TestSpliceWhileLoop(unittest.TestCase):
     def test_accumulator_view_tags_backing_storage(self):
         """A view-backed carry records ownership on its mutable Buffer."""
