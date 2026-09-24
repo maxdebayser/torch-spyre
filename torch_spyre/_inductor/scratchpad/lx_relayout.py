@@ -539,50 +539,60 @@ def movement_supported(
     """
 
     num_cores = source_num_cores
-    source_splits = dict(source.work_slice_dims)
-    destination_splits = dict(destination.work_slice_dims)
-    destination_slices = math.prod(destination_splits.values())
     if (
         num_cores <= 0
         or destination_num_cores < num_cores
         or source.num_cores != num_cores
         or destination.num_cores != destination_num_cores
         or destination_num_cores % num_cores
-        or math.prod(source_splits.values()) != num_cores
-        or destination_slices <= 0
-        or destination_num_cores % destination_slices
         or (num_cores == destination_num_cores and source.same_partition(destination))
     ):
         return False
+
+    source_splits = dict(source.work_slice_dims)
+    destination_splits = dict(destination.work_slice_dims)
+    destination_slices = math.prod(destination_splits.values())
+    if (
+        destination_slices <= 0
+        or destination_num_cores % destination_slices
+        or math.prod(source_splits.values()) != num_cores
+    ):
+        return False
+
     source_map = _core_slices(source, num_cores)
+    # Every source slice is present exactly once.
+    if len({tuple(sorted(row.items())) for row in source_map.values()}) != num_cores:
+        return False
+
     destination_map = _core_slices(destination, destination_num_cores)
-    edges = transfer_edges(
-        source_splits, destination_splits, source_map, destination_map
-    )
-    fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
-    fanin = [
-        sum(dst == core for _, dst in edges) for core in range(destination_num_cores)
-    ]
     replicas = collections.Counter(
         tuple(sorted(row.items())) for row in destination_map.values()
     )
-    return bool(edges) and all(
-        (
-            # Every source sends to the same number of destination cores.
-            len(set(fanout)) == 1,
-            # Every destination receives from the same number of source cores.
-            len(set(fanin)) == 1,
-            # Every source slice is present exactly once.
-            len({tuple(sorted(row.items())) for row in source_map.values()})
-            == num_cores,
-            # Every distinct destination slice is covered.
-            len(replicas) == destination_slices,
-            # Within one core domain, each slice has equally many copies.
-            num_cores != destination_num_cores or len(set(replicas.values())) == 1,
-            # A larger domain only broadcasts: one source per destination.
-            num_cores == destination_num_cores
-            or (fanout[0] == destination_num_cores // num_cores and fanin[0] == 1),
-        )
+    # Every distinct destination slice is covered.
+    if len(replicas) == destination_slices:
+        return False
+    # Within one core domain, each slice has equally many copies.
+    if num_cores != destination_num_cores or len(set(replicas.values())) == 1:
+        return False
+
+    edges = transfer_edges(
+        source_splits, destination_splits, source_map, destination_map
+    )
+    if not edges:
+        return False
+    fanout = [sum(src == core for src, _ in edges) for core in range(num_cores)]
+    # Every source sends to the same number of destination cores.
+    if len(set(fanout)) != 1:
+        return False
+    fanin = [
+        sum(dst == core for _, dst in edges) for core in range(destination_num_cores)
+    ]
+    # Every destination receives from the same number of source cores.
+    if len(set(fanin)) != 1:
+        return False
+    # A larger domain only broadcasts: one source per destination.
+    return num_cores == destination_num_cores or (
+        fanout[0] == destination_num_cores // num_cores and fanin[0] == 1
     )
 
 

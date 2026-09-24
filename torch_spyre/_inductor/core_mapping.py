@@ -23,6 +23,7 @@ from itertools import permutations
 from typing import Any, Callable
 
 from sympy import Expr, Integer, Mod, Symbol, floor, sympify
+from sympy.utilities.misc import as_int
 
 from torch_spyre._C import DataFormats, get_device_size_in_bytes
 from .op_spec import TensorWorkDivision
@@ -75,24 +76,24 @@ def owner_slots(
 
     if num_cores <= 0:
         raise ValueError(f"physical core count must be positive, got {num_cores}")
-    if splits.keys() != slots.keys():
+    try:
+        formulas = {dim: sympify(slots[dim]) for dim in splits}
+    except KeyError:
         raise ValueError(
             "ownership split and owner-slot dimensions differ: "
             f"{sorted(map(str, splits))} != {sorted(map(str, slots))}"
         )
-    formulas = {dim: sympify(slots[dim]) for dim in splits}
     rows = []
     for core in range(num_cores):
         row = {}
         for dim, split in splits.items():
             value = _owner_at_core(formulas[dim], core)
-            if value.free_symbols or value.is_integer is not True:
-                raise ValueError(f"non-integral owner slot {value} on core {core}")
-            if not 0 <= int(value) < int(split):
+            int_value = as_int(value, strict=True)
+            if not 0 <= int_value < split:
                 raise ValueError(
-                    f"owner slot {int(value)} outside split {split} on core {core}"
+                    f"owner slot {int_value} outside split {split} on core {core}"
                 )
-            row[dim] = int(value)
+            row[dim] = int_value
         rows.append(row)
     return tuple(rows)
 
@@ -111,20 +112,21 @@ def transfer_edges(
 
     Both partitions must describe the same coordinate domain.
     """
-    return {
-        (s_core, d_core)
-        for s_core, s_slice in source_map.items()
-        for d_core, d_slice in destination_map.items()
-        if all(
-            _overlap(
-                s_slice.get(dim, 0),
-                source_splits.get(dim, 1),
-                d_slice.get(dim, 0),
-                destination_splits.get(dim, 1),
-            )
-            for dim in source_splits.keys() | destination_splits.keys()
-        )
-    }
+    all_splits = source_splits.keys() | destination_splits.keys()
+    result = set()
+    for s_core, s_slice in source_map.items():
+        for d_core, d_slice in destination_map.items():
+            for dim in all_splits:
+                if not _overlap(
+                    s_slice.get(dim, 0),
+                    source_splits.get(dim, 1),
+                    d_slice.get(dim, 0),
+                    destination_splits.get(dim, 1),
+                ):
+                    break
+            else:
+                result.add((s_core, d_core))
+    return result
 
 
 def same_owner_maps(
@@ -396,7 +398,6 @@ def decompose_fused_split_view(
             fused_split,
             rectangles=True,
         )
-        origins = [tuple(low for low, _ in bounds) for bounds in regions]
         shapes = {tuple(high - low + 1 for low, high in bounds) for bounds in regions}
         if len(shapes) != 1:
             reject(
@@ -420,6 +421,7 @@ def decompose_fused_split_view(
             return None
 
         synthetic = {axis: Symbol(f"physical_dim_{axis}") for axis in driven}
+        origins = [tuple(low for low, _ in bounds) for bounds in regions]
         expected = tuple(
             {
                 synthetic[axis]: lo // width
