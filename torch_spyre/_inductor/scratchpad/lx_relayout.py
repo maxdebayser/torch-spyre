@@ -569,10 +569,10 @@ def movement_supported(
         tuple(sorted(row.items())) for row in destination_map.values()
     )
     # Every distinct destination slice is covered.
-    if len(replicas) == destination_slices:
+    if len(replicas) != destination_slices:
         return False
     # Within one core domain, each slice has equally many copies.
-    if num_cores != destination_num_cores or len(set(replicas.values())) == 1:
+    if num_cores == destination_num_cores and len(set(replicas.values())) != 1:
         return False
 
     edges = transfer_edges(
