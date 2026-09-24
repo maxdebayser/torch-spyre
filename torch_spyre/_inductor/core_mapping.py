@@ -88,7 +88,10 @@ def owner_slots(
         row = {}
         for dim, split in splits.items():
             value = _owner_at_core(formulas[dim], core)
-            int_value = as_int(value, strict=True)
+            try:
+                int_value = as_int(value, strict=True)
+            except ValueError:
+                raise ValueError(f"non-integral owner slot {value} on core {core}")
             if not 0 <= int_value < split:
                 raise ValueError(
                     f"owner slot {int_value} outside split {split} on core {core}"
