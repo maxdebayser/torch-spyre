@@ -3178,14 +3178,16 @@ class PerCoreView:
 
     work_slice_dims: tuple[tuple[int, int], ...]
     core_to_slot: tuple[tuple[int, Expr], ...]
-    num_cores: int
     split_product: int
+    num_cores: int
 
     def __init__(
         self,
         work_slice_dims: tuple[tuple[int, int], ...],
         core_to_slot: tuple[tuple[int, Expr], ...],
         num_cores: int | None = None,
+        *,
+        split_product: int = 0,  # dummy arg to absorb automatically copied args
     ):
         object.__setattr__(self, "work_slice_dims", work_slice_dims)
         object.__setattr__(self, "core_to_slot", core_to_slot)
@@ -3203,10 +3205,10 @@ class PerCoreView:
         return same_owner_maps(
             dict(self.work_slice_dims),
             dict(self.core_to_slot),
-            self.num_cores,
+            self.num_cores if self.num_cores is not None else self.split_product,
             dict(other.work_slice_dims),
             dict(other.core_to_slot),
-            other.num_cores,
+            other.num_cores if other.num_cores is not None else other.split_product,
         )
 
 
@@ -3402,8 +3404,6 @@ def _per_core_view_from_prep(
         False,
         False,
     )
-    if prep is None:
-        return unrepresentable
 
     # No real split -> whole-buffer view, representable regardless of layout. Must
     # precede the ``prep is None`` guard to match the original ordering.
@@ -3413,6 +3413,8 @@ def _per_core_view_from_prep(
             False,
             True,
         )
+    if prep is None:
+        return unrepresentable
     per_sym = {sym: int(splits.get(sym, 1)) for sym in prep.iter_space}
 
     # Step 2: keep splits that actually slice this buffer, keyed by their host

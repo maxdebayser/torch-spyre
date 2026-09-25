@@ -713,9 +713,6 @@ def derive_completed_reduction_routes(
     # Mask unfinished producers before the common ownership intersection.
     source_map = {group[-1]: source_map[group[-1]] for group in groups.values()}
     routes: dict[int, list[int]] = {core: [] for core in sorted(source_map)}
-    counts = {len(consumers) for consumers in routes.values()}
-    if 0 in counts or len(counts) != 1:
-        raise ValueError("completed-reduction routes require uniform fanin and fanout")
     edges = transfer_edges(splits, target, source_map, target_map)
     fanins = set()
     for destination_core in range(destination_count):
@@ -725,7 +722,8 @@ def derive_completed_reduction_routes(
         fanins.add(len(writers))
         for writer in writers:
             routes[writer].append(destination_core)
-    if len(fanins) != 1:
+    counts = {len(consumers) for consumers in routes.values()}
+    if 0 in counts or len(counts) != 1 or len(fanins) != 1:
         raise ValueError("completed-reduction routes require uniform fanin and fanout")
     return tuple((core, tuple(consumers)) for core, consumers in routes.items())
 
@@ -1076,7 +1074,6 @@ def collect_lx_relayout_plans(
                 )
                 if rejection_reason is not None:
                     break
-
             if consumer_num_cores > source_num_cores:
                 failure = (
                     "cannot emit: grouped destination does not evenly "
