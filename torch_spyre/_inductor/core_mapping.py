@@ -959,6 +959,10 @@ def partition_lx_size_bytes(
     return get_device_size_in_bytes(per_core_size, device_dtype)
 
 
+def _comparable(expr):
+    return expr if not isinstance(expr, Expr) else str(expr)
+
+
 def core_mappings_equal(
     left: Mapping[Any, Expr],
     right: Mapping[Any, Expr],
@@ -977,12 +981,19 @@ def core_mappings_equal(
         return False
     if left.keys() != right.keys():
         return False
+
     try:
         key_left = tuple(
-            sorted(((d, sympify(e)) for d, e in left.items()), key=lambda kv: kv[0])
+            sorted(
+                ((_comparable(d), sympify(e)) for d, e in left.items()),
+                key=lambda kv: kv[0],
+            )
         )
         key_right = tuple(
-            sorted(((d, sympify(e)) for d, e in right.items()), key=lambda kv: kv[0])
+            sorted(
+                ((_comparable(d), sympify(e)) for d, e in right.items()),
+                key=lambda kv: kv[0],
+            )
         )
     except (TypeError, ValueError):
         return False
