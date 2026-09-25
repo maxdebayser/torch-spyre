@@ -145,13 +145,16 @@ def same_owner_maps(
     Unsplit dimensions describe no ownership and are ignored. Equivalent SymPy
     spellings compare equal; a missing owner formula is a mismatch.
     """
-
-    left = {dim: int(split) for dim, split in left_splits.items() if int(split) > 1}
-    right = {dim: int(split) for dim, split in right_splits.items() if int(split) > 1}
-    if left != right or left_cores != right_cores:
+    if left_cores <= 0:
         return False
-    if not left:
+    if left_cores != right_cores:
+        return False
+    left = {dim: split for dim, split in left_splits.items() if split > 1}
+    right = {dim: split for dim, split in right_splits.items() if split > 1}
+    if not left and not right:
         return True
+    if left != right:
+        return False
     try:
         return core_mappings_equal(
             {dim: left_slots[dim] for dim in left},
@@ -970,20 +973,16 @@ def core_mappings_equal(
     on a 304-op graph this was 5 million ``sympify`` calls.
     """
 
-    if left.keys() != right.keys():
-        return False
     if num_cores <= 0:
+        return False
+    if left.keys() != right.keys():
         return False
     try:
         key_left = tuple(
-            sorted(
-                ((str(d), sympify(e)) for d, e in left.items()), key=lambda kv: kv[0]
-            )
+            sorted(((d, sympify(e)) for d, e in left.items()), key=lambda kv: kv[0])
         )
         key_right = tuple(
-            sorted(
-                ((str(d), sympify(e)) for d, e in right.items()), key=lambda kv: kv[0]
-            )
+            sorted(((d, sympify(e)) for d, e in right.items()), key=lambda kv: kv[0])
         )
     except (TypeError, ValueError):
         return False
@@ -992,20 +991,19 @@ def core_mappings_equal(
 
 @lru_cache(maxsize=65536)
 def _core_mappings_equal_cached(
-    left: tuple[tuple[str, Expr], ...],
-    right: tuple[tuple[str, Expr], ...],
+    left: tuple[tuple[Any, Expr], ...],
+    right: tuple[tuple[Any, Expr], ...],
     num_cores: int,
 ) -> bool:
     try:
         for (_, lf), (_, rf) in zip(left, right):
             for core in range(num_cores):
-                values = [_owner_at_core(f, core) for f in (lf, rf)]
-                if any(
-                    value.free_symbols or value.is_integer is not True
-                    for value in values
-                ):
-                    return False
-                if values[0] != values[1]:
+                try:
+                    l_val = as_int(_owner_at_core(lf, core))
+                    r_val = as_int(_owner_at_core(rf, core))
+                    if l_val != r_val:
+                        return False
+                except ValueError:
                     return False
         return True
     except (TypeError, ValueError):
