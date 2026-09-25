@@ -1077,15 +1077,12 @@ def collect_lx_relayout_plans(
                 if rejection_reason is not None:
                     break
 
-            def destination_owners():
-                return math.prod(dict(view.work_slice_dims).values())
-
             if consumer_num_cores > source_num_cores:
                 failure = (
                     "cannot emit: grouped destination does not evenly "
                     "broadcast the source"
                 )
-            elif reduction is None and destination_owners() < source_num_cores:
+            elif reduction is None and view.split_product < source_num_cores:
                 failure = (
                     "cannot emit: grouped destination does not evenly contract "
                     "the source"
