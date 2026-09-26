@@ -3179,7 +3179,7 @@ class PerCoreView:
     work_slice_dims: tuple[tuple[int, int], ...]
     core_to_slot: tuple[tuple[int, Expr], ...]
     split_product: int
-    num_cores: int
+    num_cores: int | None = None
 
     def __init__(
         self,
@@ -3194,9 +3194,6 @@ class PerCoreView:
         object.__setattr__(
             self, "split_product", math.prod(split for _, split in work_slice_dims)
         )
-        if num_cores is None:
-            num_cores = self.split_product
-
         object.__setattr__(self, "num_cores", num_cores)
 
     def same_partition(self, other: "PerCoreView") -> bool:
