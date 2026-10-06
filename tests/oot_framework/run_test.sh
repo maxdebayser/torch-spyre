@@ -1011,14 +1011,13 @@ _cleanup_wrappers() {
         rm -f "$YAML_CONFIG"
         echo "[torch_oot_device_tests_run] Removed merged temp config: $YAML_CONFIG"
     fi
-    # Remove marker sidecar JSON written by TorchTestBase.instantiate_test.
-    # Normally deleted by _XML_INJECT_PY after injection, but when --junit-xml
-    # is not supplied _XML_INJECT_PY never runs
-    local _sidecar="${YAML_CONFIG}.markers.json"
-    if [[ -f "$_sidecar" ]]; then
+    # Remove the per-process marker sidecars written by TorchTestBase.instantiate_test.
+    local _sidecar
+    for _sidecar in "${YAML_CONFIG:-}".markers.*.json; do
+        [[ -f "$_sidecar" ]] || continue
         rm -f "$_sidecar"
         echo "[torch_oot_device_tests_run] Cleaned up marker sidecar: $_sidecar"
-    fi
+    done
 }
 trap _cleanup_wrappers EXIT
 
@@ -1473,16 +1472,14 @@ echo ""
 # 12. Run pytest for each file - original / wrapper depending on TestClass
 #
 # After pytest writes the JUnit XML, a Python post-processor injects YAML
-# tags as <properties> elements directly into the XML.
-#
-# Two regex fixes make matching robust:
-#   1. (?<![a-z])name="..."  avoids matching 'name' inside 'classname="..."'
-#   2. yaml_class in classname  handles dotted XML classnames like
-#      "test.test_binary_ufuncs.TestBinaryUfuncsPRIVATEUSE1"
+# tags as <properties> elements directly into the XML. Tests the OOT
+# instantiation never marks (plain pytest files) get their file's
+# testtype__<label> tags here, so every case names the tiers it ran under.
 # ---------------------------------------------------------------------------
 
 _XML_INJECT_PY='
-import sys, re, json, os
+import sys, re, json, os, fnmatch
+import xml.etree.ElementTree as ET
 from pathlib import Path
 try:
     import yaml
@@ -1491,21 +1488,43 @@ except ImportError:
 
 xml_path, yaml_path = sys.argv[1], sys.argv[2]
 
-# Load sidecar written by TorchTestBase.instantiate_test.
+# Sidecars written by TorchTestBase.instantiate_test, one per pytest process.
 # Keys are bare method names matching the XML `name=` attribute exactly.
 # Values are already-merged lists of all tags (YAML tests tags + op__ + dtype__ + module__ markers).
+# Left in place for later shards of the same config; the EXIT trap removes them.
 _sidecar: dict = {}
-_sidecar_path = yaml_path + ".markers.json"
-try:
-    with open(_sidecar_path) as _f:
-        _sidecar = json.load(_f)
-except Exception:
-    pass
+for _sidecar_path in sorted(Path(yaml_path).parent.glob(Path(yaml_path).name + ".markers.*.json")):
+    try:
+        with open(_sidecar_path) as _f:
+            _sidecar.update(json.load(_f))
+    except Exception:
+        pass
 
 # Fallback YAML-only tag_map for tests not in sidecar
 data = yaml.safe_load(open(yaml_path)) or {}
+suite_cfg = data.get("test_suite_config", {}) or {}
+
+def _testtype_tags(labels):
+    safe = (re.sub(r"[^a-zA-Z0-9_]", "_", str(l)).strip("_") for l in labels or [])
+    return {f"testtype__{l}" for l in safe if l}
+
+# Same precedence as TEST_SUITE_LABELS: a merged config carries labels per file.
+suite_testtypes = _testtype_tags(suite_cfg.get("labels"))
+file_testtypes = {}
+for fe in suite_cfg.get("files", []) or []:
+    stem = Path(str(fe.get("path", ""))).stem
+    if stem and fe.get("labels"):
+        file_testtypes[stem] = _testtype_tags(fe["labels"])
+
+def _file_testtypes(classname):
+    for part in classname.split("."):
+        for stem, tags in file_testtypes.items():
+            if part == stem or part.startswith(stem + "__"):
+                return tags
+    return suite_testtypes
+
 tag_map: dict = {}
-for fe in data.get("test_suite_config", {}).get("files", []):
+for fe in suite_cfg.get("files", []):
     for te in fe.get("tests", []):
         tags = sorted(set(te.get("tags", []) or []))
         if not tags:
@@ -1514,6 +1533,18 @@ for fe in data.get("test_suite_config", {}).get("files", []):
             name = name.strip()
             if name:
                 tag_map.setdefault(name, set()).update(tags)
+
+# YAML names are literal, regex (LxPlanning.*) or glob (*TestModule*). The XML name
+# carries variant suffixes, so a method pattern need only match its start.
+def _matches(pattern, value, prefix=False):
+    if value.startswith(pattern) if prefix else value == pattern:
+        return True
+    if fnmatch.fnmatchcase(value, pattern + "*" if prefix else pattern):
+        return True
+    try:
+        return bool((re.match if prefix else re.fullmatch)(pattern, value))
+    except re.error:
+        return False
 
 def _all_tags(classname, testname):
     # Sidecar has the full merged tag list -- use it when available.
@@ -1526,60 +1557,30 @@ def _all_tags(classname, testname):
             yaml_class, yaml_method = yaml_name.split("::", 1)
         else:
             yaml_class, yaml_method = "", yaml_name
-        if ((yaml_class and yaml_method
-                and yaml_class in classname
-                and testname.startswith(yaml_method))
-                or (yaml_method and not yaml_class
-                    and testname.startswith(yaml_method))):
+        if yaml_method and _matches(yaml_method, testname, prefix=True) and (
+                not yaml_class or yaml_class in classname
+                or any(_matches(yaml_class, part) for part in classname.split("."))):
             matched.update(tags)
     return sorted(matched)
 
-def build_props(tags):
-    return "<properties>" + "".join(
-        f"<property name=\"tag\" value=\"{t}\"/>" for t in tags
-    ) + "</properties>"
-
-def inject_full(m):
-    attrs, content = m.group(1), m.group(2)
-    cn = re.search(r"classname=\"([^\"]*)\"", attrs)
-    tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
-    if not cn or not tn:
-        return m.group(0)
-    tags = _all_tags(cn.group(1), tn.group(1))
+tree = ET.parse(xml_path)
+for tc in tree.getroot().iter("testcase"):
+    cn, tn = tc.get("classname", ""), tc.get("name", "")
+    if not tn:
+        continue
+    tags = set(_all_tags(cn, tn))
+    if not any(t.startswith("testtype__") for t in tags):
+        tags |= _file_testtypes(cn)
     if not tags:
-        return m.group(0)
-    if "<properties>" in content:
-        existing = set(re.findall(r"<property name=\"tag\" value=\"([^\"]*)\"/>", content))
-        new_props = "".join(
-            f"<property name=\"tag\" value=\"{t}\"/>"
-            for t in tags if t not in existing
-        )
-        if not new_props:
-            return m.group(0)
-        content = content.replace("</properties>", new_props + "</properties>", 1)
-        return f"<testcase{attrs}>{content}</testcase>"
-    return f"<testcase{attrs}>{build_props(tags)}{content}</testcase>"
-
-def inject_self_closing(m):
-    attrs = m.group(1)
-    cn = re.search(r"classname=\"([^\"]*)\"", attrs)
-    tn = re.search(r"(?<![a-z])name=\"([^\"]*)\"", attrs)
-    if not cn or not tn:
-        return m.group(0)
-    tags = _all_tags(cn.group(1), tn.group(1))
-    if not tags:
-        return m.group(0)
-    return f"<testcase{attrs}>{build_props(tags)}</testcase>"
-
-xml = Path(xml_path).read_text()
-xml = re.sub(r"<testcase([^>]*)>(.*?)</testcase>", inject_full,        xml, flags=re.DOTALL)
-xml = re.sub(r"<testcase([^>]*?)/>",               inject_self_closing, xml)
-Path(xml_path).write_text(xml)
-
-try:
-    os.remove(_sidecar_path)
-except OSError:
-    pass
+        continue
+    props = tc.find("properties")
+    if props is None:
+        props = ET.Element("properties")
+        tc.insert(0, props)
+    existing = {p.get("value") for p in props.findall("property") if p.get("name") == "tag"}
+    for t in sorted(tags - existing):
+        ET.SubElement(props, "property", name="tag", value=t)
+tree.write(xml_path, encoding="utf-8", xml_declaration=True)
 
 print(f"[torch_oot_device_tests_run] Tags injected into XML: {xml_path}", flush=True)
 '
@@ -1716,53 +1717,44 @@ _parse_pytest_summary_line() {
 # XML shard merger: combines N JUnit XML files (each produced by a separate
 # pytest run) into one, summing suite-level counters and concatenating all
 # <testcase> elements (which already carry their injected <properties> tags).
+# Parsed, not regex-matched: a self-closing <testcase/> followed by a full one
+# otherwise matches both patterns and lands in the output twice.
 # ---------------------------------------------------------------------------
 _XML_MERGE_PY='
-import sys, re
-from pathlib import Path
+import sys
+import xml.etree.ElementTree as ET
 
 out_path    = sys.argv[1]
 shard_paths = sys.argv[2:]
 
-all_cases   = []
-total_tests = 0
-total_err   = 0
-total_fail  = 0
-total_skip  = 0
-total_time  = 0.0
-
-def _attr(xml, name, default="0"):
-    m = re.search(rf"{name}=\"([^\"]*)\"", xml)
-    return m.group(1) if m else default
+counters = {"tests": 0, "errors": 0, "failures": 0, "skipped": 0}
+total_time = 0.0
+merged_suite = ET.Element("testsuite", name="pytest")
 
 for sp in shard_paths:
-    txt = Path(sp).read_text()
-    suite_m = re.search(r"<testsuite([^>]*)>", txt)
-    if suite_m:
-        attrs = suite_m.group(1)
-        total_tests += int(_attr(attrs, "tests"))
-        total_err   += int(_attr(attrs, "errors"))
-        total_fail  += int(_attr(attrs, "failures"))
-        total_skip  += int(_attr(attrs, "skipped"))
+    try:
+        root = ET.parse(sp).getroot()
+    except ET.ParseError as e:
+        print(f"[torch_oot_device_tests_run] WARNING: skipping unparsable shard {sp}: {e}", file=sys.stderr)
+        continue
+    for suite in root.iter("testsuite"):
+        for k in counters:
+            counters[k] += int(suite.get(k, "0") or 0)
         try:
-            total_time += float(_attr(attrs, "time", "0"))
+            total_time += float(suite.get("time", "0") or 0)
         except ValueError:
             pass
-    # Collect full and self-closing <testcase> blocks.
-    blocks  = re.findall(r"<testcase[^>]*>.*?</testcase>", txt, re.DOTALL)
-    blocks += re.findall(r"<testcase[^>]*/>",              txt)
-    all_cases.extend(blocks)
+        for k in ("timestamp", "hostname"):
+            if suite.get(k) and merged_suite.get(k) is None:
+                merged_suite.set(k, suite.get(k))
+        merged_suite.extend(suite.findall("testcase"))
 
-merged = (
-    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
-    "<testsuites>"
-    f"<testsuite name=\"pytest\" tests=\"{total_tests}\" "
-    f"errors=\"{total_err}\" failures=\"{total_fail}\" "
-    f"skipped=\"{total_skip}\" time=\"{total_time:.3f}\">"
-    + "\n".join(all_cases)
-    + "</testsuite></testsuites>"
-)
-Path(out_path).write_text(merged)
+for k, v in counters.items():
+    merged_suite.set(k, str(v))
+merged_suite.set("time", f"{total_time:.3f}")
+root = ET.Element("testsuites")
+root.append(merged_suite)
+ET.ElementTree(root).write(out_path, encoding="utf-8", xml_declaration=True)
 print(f"[torch_oot_device_tests_run] Merged {len(shard_paths)} XML shard(s) -> {out_path}", flush=True)
 '
 
@@ -2038,9 +2030,11 @@ _run_xdist_fallback() {
         OVERALL_EXIT=$_xexit
     fi
 
-    # Inject XML tags into the shard produced by the xdist run.
+    # Inject XML tags into the shard produced by the xdist run, and mark it a retry: the
+    # re-run overwrote the first attempt's XML.
     if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
         python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
+        python3 "${_SCRIPT_DIR}/../../extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py" signal "$_shard_xml" || true
     fi
 }
 
@@ -2102,6 +2096,22 @@ except Exception as e:
     echo 1
 }
 
+# Sets the caller's _probe_slot to a card slot in [0, $1) not held by a running probe, waiting if all are busy.
+_claim_probe_slot() {
+    local _n="$1" _s _pid _running
+    while :; do
+        _running=" $(jobs -rp | tr '\n' ' ') "
+        for (( _s=0; _s<_n; _s++ )); do
+            _pid="${_probe_slot_pids[$_s]:-}"
+            if [[ -z "$_pid" || "$_running" != *" $_pid "* ]]; then
+                _probe_slot=$_s
+                return
+            fi
+        done
+        wait -n 2>/dev/null || true
+    done
+}
+
 # ---------------------------------------------------------------------------
 # _run_parallel_across_cards
 #
@@ -2120,8 +2130,8 @@ except Exception as e:
 #
 # Collection uses `pytest --collect-only -q` run from the file's directory
 # so conftest.py and SPYRE_TEST_FILE / OOT_TEST_FILE are set up identically
-# to a real run.  Collection is done without SPYRE_DEVICES so the runtime
-# is not loaded.
+# to a real run.
+# Collection opens a card (upstream conftest seeds the RNG), so each concurrent probe gets its own card (#5150).
 #
 # Globals read:   RUN_FILES TEST_FILES _EXTRA_NO_XML _FINAL_XML_PATH
 #                 YAML_CONFIG _XML_INJECT_PY
@@ -2149,6 +2159,31 @@ _run_parallel_across_cards() {
     local _collect_start=$SECONDS
 
     # -----------------------------------------------------------------------
+    # Card-slot -> physical SPYRE_DEVICES index mapping.
+    #
+    # _n_cards is a count (e.g. 3), not a list of physical device indices.
+    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
+    # "1,5,7"), device_count() already narrows the detected count to match,
+    # but the physical indices are NOT 0..N-1 -- they are exactly the values
+    # listed. Each per-card subshell must export its real index, not its
+    # position in the round-robin loop, or it ends up targeting cards the
+    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
+    # -----------------------------------------------------------------------
+    local -a _CARD_DEVICE_IDS=()
+    local _k
+    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
+        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
+    fi
+    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
+        # No restriction (or a mismatched one) -- fall back to the natural
+        # 0..N-1 physical indexing.
+        _CARD_DEVICE_IDS=()
+        for (( _k=0; _k<_n_cards; _k++ )); do
+            _CARD_DEVICE_IDS+=("$_k")
+        done
+    fi
+
+    # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
     #
     # Output of `pytest --collect-only -q` looks like:
@@ -2160,11 +2195,9 @@ _run_parallel_across_cards() {
     # We keep only lines that contain "::" (node IDs), discarding the
     # summary line and any warnings.
     #
-    # Per-file collection is done with SPYRE_TEST_FILE set (so the OOT
-    # framework can identify the config) but without SPYRE_DEVICES / hardware
-    # initialisation so collection is fast even on a login node.
+    # Per-file collection sets SPYRE_TEST_FILE so the OOT framework can identify the config.
     #
-    # Collection needs no hardware, so the per-file `--collect-only` probes
+    # The per-file `--collect-only` probes
     # are fanned out as background jobs (bounded to _n_cards concurrent) and
     # each writes its raw node IDs to a per-file temp file. Running them
     # serially and foreground here was the dominant cost of --parallel (every
@@ -2194,8 +2227,9 @@ _run_parallel_across_cards() {
         done
     fi
 
-    # Fan out collection: one background probe per file, bounded to _n_cards
-    # concurrent jobs. Each writes matched node IDs to _collect_out_files[i].
+    # Fan out collection: one background probe per file, each pinned to a free card slot.
+    local -a _probe_slot_pids=()
+    local _probe_slot
     local -a _collect_out_files=()
     # Parallel array to _collect_out_files, indexed the same way, holding each probe's stderr path.
     local -a _collect_err_files=()
@@ -2220,23 +2254,16 @@ _run_parallel_across_cards() {
 
         echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
+        # Blocks until a card slot is free -- this is also the concurrency throttle.
+        _claim_probe_slot "$_n_cards"
         (
             # A 0-match --collect-only (or a killed probe) is expected/handled below, not a script-ending error.
             set +euo pipefail
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
-            # Give this probe its own Inductor cache dir so concurrent collect-only imports
-            # don't share cache state. Bucketed by the same concurrency bound as the probe
-            # throttle (not by file), so only _n_cards dirs ever exist -- keying by file index
-            # instead was tried and measurably slower (every probe pays a cold-cache setup
-            # cost instead of most reusing an already-warmed slot's dir), without actually
-            # preventing failures: the same handful of heavy-import files still failed on a
-            # contended first attempt even with fully unique dirs, and it was the retry below
-            # (a fresh, less-contended attempt -- not cache-dir isolation) that reliably saved
-            # them. So slot bucketing stays naive here; a same-slot collision, if it ever
-            # happens, is caught by that retry instead of prevented up front.
+            export SPYRE_DEVICES="${_CARD_DEVICE_IDS[$_probe_slot]}"
+            # One Inductor cache dir per slot (per-file dirs were measurably slower: cold cache each probe).
             _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
-            _probe_slot=$(( i % _n_cards ))
             export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
@@ -2246,11 +2273,7 @@ _run_parallel_across_cards() {
             echo "${PIPESTATUS[0]}" > "$_cexit"
         ) &
         _collect_pids+=($!)
-
-        # Throttle to at most _n_cards concurrent probes.
-        while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
-            wait -n 2>/dev/null || true
-        done
+        _probe_slot_pids[$_probe_slot]=$!
     done
 
     # Wait for any remaining probes to finish before reading their output.
@@ -2332,10 +2355,13 @@ _run_parallel_across_cards() {
             _retry_out_files[$i]="$_rout"
             _retry_err_files[$i]="$_rerr"
             _retry_exit_files[$i]="$_rexit"
+            # Same card pinning as the first pass, capped at this round's worker limit.
+            _claim_probe_slot "$_retry_workers"
             (
                 set +euo pipefail
                 export SPYRE_TEST_FILE="$_rf2"
                 export OOT_TEST_FILE="$_rf2"
+                export SPYRE_DEVICES="${_CARD_DEVICE_IDS[$_probe_slot]}"
                 # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
                 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
                 cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
@@ -2345,9 +2371,7 @@ _run_parallel_across_cards() {
                 echo "${PIPESTATUS[0]}" > "$_rexit"
             ) &
             _retry_pids+=($!)
-            while [[ "$(jobs -rp | wc -l)" -ge "$_retry_workers" ]]; do
-                wait -n 2>/dev/null || true
-            done
+            _probe_slot_pids[$_probe_slot]=$!
         done
         for _rpid in "${_retry_pids[@]+"${_retry_pids[@]}"}"; do
             wait "$_rpid" 2>/dev/null || true
@@ -2457,7 +2481,6 @@ _run_parallel_across_cards() {
     # Format per line:  <file_idx>:<node_id>
     # -----------------------------------------------------------------------
     local -a _card_id_files=()
-    local _k
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _f="/tmp/_spyre_card_ids_${$}_${_k}.tmp"
         : > "$_f"
@@ -2469,31 +2492,7 @@ _run_parallel_across_cards() {
         echo "${_all_node_file_idx[$j]}:${_all_node_ids[$j]}" >> "${_card_id_files[$_k]}"
     done
 
-    # -----------------------------------------------------------------------
-    # Card-slot -> physical SPYRE_DEVICES index mapping.
-    #
-    # _n_cards is a count (e.g. 3), not a list of physical device indices.
-    # When the caller restricted visible devices with SPYRE_DEVICES (e.g.
-    # "1,5,7"), device_count() already narrows the detected count to match,
-    # but the physical indices are NOT 0..N-1 -- they are exactly the values
-    # listed. Each per-card subshell must export its real index, not its
-    # position in the round-robin loop, or it ends up targeting cards the
-    # caller never listed (e.g. card 0 when only 1,5,7 were authorized).
-    # -----------------------------------------------------------------------
-    local -a _CARD_DEVICE_IDS=()
-    if [[ -n "${SPYRE_DEVICES:-}" ]]; then
-        IFS=',' read -r -a _CARD_DEVICE_IDS <<< "${SPYRE_DEVICES}"
-    fi
-    if [[ "${#_CARD_DEVICE_IDS[@]}" -ne "$_n_cards" ]]; then
-        # No restriction (or a mismatched one) -- fall back to the natural
-        # 0..N-1 physical indexing.
-        _CARD_DEVICE_IDS=()
-        for (( _k=0; _k<_n_cards; _k++ )); do
-            _CARD_DEVICE_IDS+=("$_k")
-        done
-    fi
-
-    # Print the assignment summary.
+    # Print the assignment summary (card -> physical index from _CARD_DEVICE_IDS above).
     for (( _k=0; _k<_n_cards; _k++ )); do
         local _cnt
         _cnt=$(wc -l < "${_card_id_files[$_k]}" 2>/dev/null || echo 0)
@@ -2708,6 +2707,7 @@ _run_parallel_across_cards() {
                                 fi
                                 if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
                                     python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
+                                    python3 "${_SCRIPT_DIR}/../../extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py" signal "$_shard_xml" || true
                                 fi
                                 # Accumulate counts from xdist retry output.
                                 if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_xdist_par_out" ]]; then
