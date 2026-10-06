@@ -219,6 +219,11 @@ VECTOR_NORM_KEEPDIM_PARAM_SETS = {
 
 
 SPYRE_MODE_SUPPORT_OVERRIDES_BY_OP = {
+    torch.min: {
+        "compiled": True,
+        "eager": False,
+        "reason": "Spyre eager aten::min.dim_min is not supported yet",
+    },
     torch.aminmax: {
         "compiled": True,
         "eager": False,
