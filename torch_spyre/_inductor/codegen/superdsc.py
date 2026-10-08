@@ -265,6 +265,10 @@ _FP16_MIN = -65504.0
 
 _POINTWISE_PADDING_MASK_VALUE: dict[str, float] = {
     "exp": -1e4,  # exp(-1e4) underflows to 0 in fp16; see NOTE above.
+    "reciprocal": float("inf"),
+    "rsqrt": float("inf"),
+    "log": 1,
+    "realdiv": float("inf"),
 }
 
 

@@ -1067,5 +1067,95 @@ class TestLowerPadSequenceBroadcastDim(unittest.TestCase):
         self.assertNotEqual(stride[2], stride[0])
 
 
+class TestPaddingNaN(unittest.TestCase):
+    """Regression tests for matmul output corruption that surfaces as NaNs.
+
+    When the padding inside the sticks becomes corrupted by the presence of
+    NaNs, the result of the matmul in the valid region also becomes corrupted.
+    """
+
+    DTYPE = torch.float16
+
+    def _assert_matches_cpu_and_has_no_nan(
+        self,
+        device_result: torch.Tensor,
+        cpu_expected: torch.Tensor,
+        atol: float = 0.1,
+        rtol: float = 0.1,
+    ) -> None:
+        result_cpu = device_result.cpu()
+        self.assertFalse(
+            torch.isnan(result_cpu).any().item(),
+            f"Compiled Spyre output contains NaN:\n{result_cpu}",
+        )
+        torch.testing.assert_close(result_cpu, cpu_expected, atol=atol, rtol=rtol)
+
+    def test_division(self) -> None:
+        """``(x / z) @ y`` -- division_compiled.py."""
+        a_cpu = torch.full((64, 32), 2, dtype=self.DTYPE)
+        b_cpu = torch.full((32, 64), 2, dtype=self.DTYPE)
+        c_cpu = torch.full((64, 32), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+        c_spyre = c_cpu.to(device="spyre")
+
+        def fn(x, y, z):
+            r = torch.reciprocal(x)  # noqa: F841
+            return (x / z) @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre, c_spyre)
+        expected = fn(a_cpu, b_cpu, c_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+    def test_pow_neg(self) -> None:
+        """``torch.pow(x, -1.0) @ y`` -- pow_neg_compiled.py."""
+        a_cpu = torch.full((64, 32), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((32, 64), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+
+        def fn(x, y):
+            r = torch.pow(x, -1.0)
+            return r @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre)
+        expected = fn(a_cpu, b_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+    def test_reciprocal(self) -> None:
+        """``torch.reciprocal(x) @ y`` -- reciprocal_compiled.py."""
+        a_cpu = torch.full((64, 32), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((32, 64), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+
+        def fn(x, y):
+            r = torch.reciprocal(x)
+            return r @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre)
+        expected = fn(a_cpu, b_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+    def test_rsqrt(self) -> None:
+        """``torch.rsqrt(x) @ y`` -- rsqrt_compiled.py."""
+        a_cpu = torch.full((64, 32), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((32, 64), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+
+        def fn(x, y):
+            r = torch.rsqrt(x)
+            return r @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre)
+        expected = fn(a_cpu, b_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
