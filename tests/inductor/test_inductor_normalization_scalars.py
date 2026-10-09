@@ -110,12 +110,6 @@ class TestNormalizationScalarOperations:
     def test_rmsnorm(self, execution_mode, eps, dtype, batch, seq, hidden):
         """Test RMSNorm with various epsilon values and configurations."""
 
-        # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
-        if dtype == torch.float32:
-            pytest.xfail(
-                reason="FP32 reductions on padded sticks currently unsupported (backend masking issue)"
-            )
-
         def rmsnorm(x):
             rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
             return x / rms
@@ -195,13 +189,8 @@ class TestNormalizationScalarOperations:
             execution_mode, rmsnorm_fp32_upcast, x, weight, atol=1e-2, rtol=1e-2
         )
 
-    # TODO: Issue https://github.com/torch-spyre/torch-spyre/issues/2534
     def test_rmsnorm_with_weight(self, execution_mode):
         """Test RMSNorm with learnable weight parameter."""
-        pytest.xfail(
-            "FP32 reductions on padded sticks currently unsupported (backend masking issue)"
-        )
-
         eps = 1e-6
         hidden_size = 768
 
@@ -247,10 +236,6 @@ class TestNormalizationScalarOperations:
             execution_mode, batchnorm_2d_inference, x, atol=tol[0], rtol=tol[1]
         )
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1531
-    @pytest.mark.xfail(
-        reason="Square root operation on float32 (IEEE_FP32) not supported"
-    )
     def test_batchnorm_identity_running_stats_1d(self, execution_mode):
         """1D inference-style norm with **identity** running mean/var."""
 
@@ -266,11 +251,16 @@ class TestNormalizationScalarOperations:
         _compare_modes(execution_mode, batchnorm_1d_inference, x, atol=1e-4, rtol=1e-3)
 
     # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1377
-    @pytest.mark.xfail(
-        reason="Spyre: Broadcasting size-1 dimensions - cannot map stick expr to host dimension"
-    )
-    def test_batchnorm_identity_affine_2d(self, execution_mode):
+    def test_batchnorm_identity_affine_2d(self, execution_mode, request):
         """2D norm with identity running stats plus gamma/beta."""
+        if execution_mode == "eager":
+            # Only the eager variant still fails; compiled passes.
+            request.applymarker(
+                pytest.mark.xfail(
+                    reason="Spyre: Broadcasting size-1 dimensions - cannot map "
+                    "stick expr to host dimension"
+                )
+            )
 
         eps = 1e-5
         num_channels = 64
@@ -465,16 +455,6 @@ class TestModelScalarOperations:
         self, execution_mode, batch, heads, seq, d_k
     ):
         """``matmul(Q,K^T) / sqrt(d_k)`` — scaled dot-product logits only (no V); several (batch, heads, seq) configs."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/543
-        if execution_mode == "eager":
-            pytest.xfail(
-                reason="Eager mode: aten::_reshape_alias operation not implemented"
-            )
-        # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1730
-        if seq == 1024 and execution_mode == "compiled":
-            pytest.xfail(
-                reason="Assertion Error: Numerical mismatch (45-48% elements) for seq=1024"
-            )
         scale = 1.0 / math.sqrt(d_k)
 
         def scaled_qk_logits(q, k):
@@ -673,9 +653,6 @@ class TestModelScalarOperations:
 
     def test_log_sum_exp_stability(self, execution_mode):
         """Stable log-sum-exp (``max`` + ``log`` + ``sum(exp)``), not ``torch.logsumexp``."""
-        # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/453
-        if execution_mode == "eager":
-            pytest.xfail(reason="Max (aten::max.dim_max) operation not implemented")
 
         def log_sum_exp(x):
             max_val = torch.max(x, dim=-1, keepdim=True)[0]
@@ -699,8 +676,6 @@ class TestModelScalarOperations:
             execution_mode, moe_loss, main_loss, aux_loss, atol=4e-3, rtol=4e-3
         )
 
-    # TODO: ISSUE https://github.com/torch-spyre/torch-spyre/issues/1387
-    @pytest.mark.xfail(reason="Clamp (aten::clamp) operation not implemented")
     def test_quantization_scale_int8(self, execution_mode):
         """Test INT8 quantization with scale factor."""
 
