@@ -3829,8 +3829,8 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _reduction_op(_E2E_SHAPE)
 
         with patch(
-            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_info_from_op",
-            return_value=({"arg1"}, {}, {sympy.Symbol("indirect0"): 8}),
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_load_subs_from_op",
+            return_value=({}, {sympy.Symbol("indirect0"): 8}),
         ):
             plan = plan_span_overflow_tile(op, max_cores=4)
 
@@ -3849,8 +3849,8 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch(
-                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_info_from_op",
-                return_value=({"arg0"}, {}, {sympy.Symbol("indirect0"): 8}),
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_load_subs_from_op",
+                return_value=({}, {sympy.Symbol("indirect0"): 8}),
             ),
             patch(
                 "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
@@ -4880,8 +4880,8 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
 
         with patch.object(
             soha,
-            "indirect_info_from_op",
-            return_value=({"arg0"}, {}, {sympy.Symbol("indirect0"): 8}),
+            "indirect_load_subs_from_op",
+            return_value=({}, {sympy.Symbol("indirect0"): 8}),
         ):
             plan = plan_span_overflow_tile(op, max_cores=4)
 
