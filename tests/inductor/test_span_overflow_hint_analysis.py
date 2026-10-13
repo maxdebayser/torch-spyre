@@ -2247,8 +2247,8 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _pointwise_op(_E2E_SHAPE)
 
         with patch(
-            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_info_from_op",
-            return_value=({"arg1"}, {}, {sympy.Symbol("indirect0"): 8}),
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.indirect_load_subs_from_op",
+            return_value=({}, {sympy.Symbol("indirect0"): 8}),
         ):
             plan = plan_span_overflow_tile(op, max_cores=4)
 

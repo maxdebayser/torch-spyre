@@ -117,7 +117,7 @@ def _scatter_access_subs_and_sizes(
     Returns ({sym: IndirectAccess(...)}, {sym: size}).
     """
 
-    store_subs, _ = _build_indirect_store_subs(scatter_op)
+    store_subs = _build_indirect_store_subs(scatter_op)
 
     # Extract the actual scatter index symbols from write_dep.index.
     # These are symbols that appear in the write but NOT in write_dep.ranges.
