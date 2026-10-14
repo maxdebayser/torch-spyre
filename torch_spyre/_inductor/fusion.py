@@ -18,6 +18,7 @@ from torch._inductor.ir import ComputedBuffer
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     FusedSchedulerNode,
+    NopKernelSchedulerNode,
     SchedulerNode,
 )
 from . import config
@@ -92,6 +93,10 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
         # SEGMENT_OFFSETS, which has a fixed number of slots.  Fusing ops could
         # exceed that slot count, so disable fusion when symbolic args are off.
         return nodes
+
+    # Remove NopKernelSchedulerNodes because they can prevent the fusion
+    # of nodes before and after them
+    nodes = [node for node in nodes if not isinstance(node, NopKernelSchedulerNode)]
 
     # One bundle per maximal contiguous run of fusable nodes; a boundary node
     # comes back as a single-element run, and ``_make_fused`` returns it
