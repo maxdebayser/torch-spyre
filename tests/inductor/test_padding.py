@@ -36,6 +36,10 @@ from torch._inductor.ir import (
 )
 from torch._inductor.graph import GraphLowering
 from torch._inductor.virtualized import V
+from torch.testing._internal.common_utils import (
+    instantiate_parametrized_tests,
+    parametrize,
+)
 
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
@@ -57,6 +61,7 @@ from torch_spyre._inductor.wsr.propagate_named_dims import (
 )
 from torch_spyre._inductor.scratchpad import allocator
 from torch_spyre._inductor.scratchpad import utils as scratchpad_utils
+from utils_inductor import try_reinterpret_host_shape
 
 
 Ts = TypeVarTuple("Ts")
@@ -1107,13 +1112,130 @@ class TestLowerPadSequenceBroadcastDim(unittest.TestCase):
         self.assertNotEqual(stride[2], stride[0])
 
 
-class TestPaddingNaN(unittest.TestCase):
+def full_half_stick(dtype: torch.dtype):
+    elems = get_elem_in_stick(dtype)
+    return elems, elems // 2
+
+
+COORD_MASK_DTYPES = [torch.float32, torch.float16]
+
+
+@instantiate_parametrized_tests
+class TestCoordinateMasking(unittest.TestCase):
+    """Regression tests for operations that can create NaNs in padding.
+
+    The creation of NaNs is suporessed by the coordinate masking
+    in `superdsc.py`.
+    """
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    def test_division(self, dtype) -> None:
+        full, half = full_half_stick(dtype)
+        a_spyre = torch.full((full, half), 2, dtype=dtype, device="spyre")
+        b_spyre = torch.full((full, half), 2, dtype=dtype, device="spyre")
+
+        def fn(x, y):
+            return x / y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre)
+
+        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
+            :, half:
+        ]
+        assert (exposed_padding == 0).all().item()
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    def test_exp(self, dtype) -> None:
+        full, half = full_half_stick(dtype)
+        a_spyre_full = torch.full((full, full), 222, dtype=dtype, device="spyre")
+        a_spyre = try_reinterpret_host_shape(a_spyre_full, (full, half))
+
+        def fn(x):
+            return torch.exp(x)
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre)
+
+        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
+            :, half:
+        ]
+        assert (exposed_padding == 0).all().item()
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    def test_pow_neg(self, dtype) -> None:
+        full, half = full_half_stick(dtype)
+        a_spyre = torch.full((full, half), 0.5, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return torch.pow(x, -1.0)
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre)
+
+        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
+            :, half:
+        ]
+        assert (exposed_padding == 0).all().item()
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    def test_reciprocal(self, dtype) -> None:
+        full, half = full_half_stick(dtype)
+        a_spyre = torch.full((full, half), 0.5, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return torch.reciprocal(x)
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre)
+
+        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
+            :, half:
+        ]
+        assert (exposed_padding == 0).all().item()
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
+    def test_rsqrt(self, dtype) -> None:
+        full, half = full_half_stick(dtype)
+        a_spyre = torch.full((full, half), 0.5, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return torch.rsqrt(x)
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre)
+
+        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
+            :, half:
+        ]
+        assert (exposed_padding < 1e-4).all().item()
+
+    # Log is not supported on IEEE_FP32 yet
+    @parametrize("dtype", [torch.float16])
+    def test_log(self, dtype) -> None:
+        full, half = full_half_stick(dtype)
+        a_spyre = torch.full((full, half), 0.5, dtype=dtype, device="spyre")
+
+        def fn(x):
+            return torch.log(x)
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre)
+
+        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
+            :, half:
+        ]
+        assert (exposed_padding == 0).all().item()
+
+
+class TestMatmulPaddingNaN(unittest.TestCase):
     """Regression tests for matmul output corruption that surfaces as NaNs.
 
     When the padding inside the sticks becomes corrupted by the presence of
     NaNs, the result of the matmul in the valid region also becomes corrupted.
     """
 
+    # For now batched matmuls aren't supported with float 32
     DTYPE = torch.float16
 
     def _assert_matches_cpu_and_has_no_nan(
@@ -1132,15 +1254,15 @@ class TestPaddingNaN(unittest.TestCase):
 
     def test_division(self) -> None:
         """``(x / z) @ y`` -- division_compiled.py."""
-        a_cpu = torch.full((64, 32), 2, dtype=self.DTYPE)
-        b_cpu = torch.full((32, 64), 2, dtype=self.DTYPE)
-        c_cpu = torch.full((64, 32), 2, dtype=self.DTYPE)
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 2, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
+        c_cpu = torch.full((full, half), 2, dtype=self.DTYPE)
         a_spyre = a_cpu.to(device="spyre")
         b_spyre = b_cpu.to(device="spyre")
         c_spyre = c_cpu.to(device="spyre")
 
         def fn(x, y, z):
-            r = torch.reciprocal(x)  # noqa: F841
             return (x / z) @ y
 
         compiled = torch.compile(fn, fullgraph=True)
@@ -1150,8 +1272,9 @@ class TestPaddingNaN(unittest.TestCase):
 
     def test_pow_neg(self) -> None:
         """``torch.pow(x, -1.0) @ y`` -- pow_neg_compiled.py."""
-        a_cpu = torch.full((64, 32), 0.5, dtype=self.DTYPE)
-        b_cpu = torch.full((32, 64), 2, dtype=self.DTYPE)
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
         a_spyre = a_cpu.to(device="spyre")
         b_spyre = b_cpu.to(device="spyre")
 
@@ -1165,9 +1288,9 @@ class TestPaddingNaN(unittest.TestCase):
         self._assert_matches_cpu_and_has_no_nan(result, expected)
 
     def test_reciprocal(self) -> None:
-        """``torch.reciprocal(x) @ y`` -- reciprocal_compiled.py."""
-        a_cpu = torch.full((64, 32), 0.5, dtype=self.DTYPE)
-        b_cpu = torch.full((32, 64), 2, dtype=self.DTYPE)
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
         a_spyre = a_cpu.to(device="spyre")
         b_spyre = b_cpu.to(device="spyre")
 
@@ -1181,14 +1304,30 @@ class TestPaddingNaN(unittest.TestCase):
         self._assert_matches_cpu_and_has_no_nan(result, expected)
 
     def test_rsqrt(self) -> None:
-        """``torch.rsqrt(x) @ y`` -- rsqrt_compiled.py."""
-        a_cpu = torch.full((64, 32), 0.5, dtype=self.DTYPE)
-        b_cpu = torch.full((32, 64), 2, dtype=self.DTYPE)
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
         a_spyre = a_cpu.to(device="spyre")
         b_spyre = b_cpu.to(device="spyre")
 
         def fn(x, y):
             r = torch.rsqrt(x)
+            return r @ y
+
+        compiled = torch.compile(fn, fullgraph=True)
+        result = compiled(a_spyre, b_spyre)
+        expected = fn(a_cpu, b_cpu)
+        self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+    def test_log(self) -> None:
+        full, half = full_half_stick(self.DTYPE)
+        a_cpu = torch.full((full, half), 0.5, dtype=self.DTYPE)
+        b_cpu = torch.full((half, full), 2, dtype=self.DTYPE)
+        a_spyre = a_cpu.to(device="spyre")
+        b_spyre = b_cpu.to(device="spyre")
+
+        def fn(x, y):
+            r = torch.log(x)
             return r @ y
 
         compiled = torch.compile(fn, fullgraph=True)
