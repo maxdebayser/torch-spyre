@@ -17,7 +17,6 @@ from collections.abc import Callable, Sequence
 from torch._inductor.ir import ComputedBuffer
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
-    ExternKernelSchedulerNode,
     FusedSchedulerNode,
     NopKernelSchedulerNode,
     SchedulerNode,
@@ -73,9 +72,7 @@ def group_contiguous_fusable(items: list, is_fusable: Callable) -> list[list]:
         if is_fusable(item):
             run.append(item)
             continue
-        if len(run) > 0 and isinstance(
-            item, (NopKernelSchedulerNode, ExternKernelSchedulerNode)
-        ):
+        if len(run) > 0 and isinstance(item, NopKernelSchedulerNode):
             # Reorder NopKernelSchedulerNodes because they prevent
             # the fusion of nodes before and after them
             groups.append([item])
