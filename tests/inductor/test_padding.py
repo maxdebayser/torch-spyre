@@ -1096,6 +1096,35 @@ class TestCoordinateMasking(unittest.TestCase):
         assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
+    @parametrize("broadcast", ["divisor", "dividend"])
+    @parametrize("half_sticks", [1, 5, 11])
+    def test_division_broadcast(self, dtype, broadcast, half_sticks) -> None:
+        # An operand broadcast along the padded stick dim (e.g. a reduction
+        # result) must not get a coordinate mask: SAMV skips it, so realdiv's
+        # inf mask leaks into the padding (inf / y), and at 5.5 sticks the
+        # backend also corrupted valid lanes.
+        full, half = full_half_stick(dtype)
+        width = half * half_sticks
+        shapes = {
+            "divisor": ((full, width), (full, 1)),
+            "dividend": ((full, 1), (full, width)),
+        }
+        x_shape, y_shape = shapes[broadcast]
+        a_spyre = torch.full(x_shape, 3, dtype=dtype, device="spyre")
+        b_spyre = torch.full(y_shape, 2, dtype=dtype, device="spyre")
+
+        def fn(x, y):
+            return x / y
+
+        # dynamic=False: a recompile with symbolic widths takes another path.
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
+        result = compiled(a_spyre, b_spyre)
+
+        torch.testing.assert_close(
+            result.cpu(), torch.full((full, width), 1.5, dtype=dtype)
+        )
+
+    @parametrize("dtype", COORD_MASK_DTYPES)
     def test_exp(self, dtype) -> None:
         full, half = full_half_stick(dtype)
         a_spyre_full = torch.full((full, full), 222, dtype=dtype, device="spyre")

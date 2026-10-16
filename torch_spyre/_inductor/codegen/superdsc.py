@@ -312,7 +312,11 @@ def _get_mask_value(
 
 
 def _get_coordinate_mask(
-    iteration_space: dict, arg: SDSCArgs, dim_padding: dict, op: str = ""
+    iteration_space: dict,
+    arg: SDSCArgs,
+    dim_padding: dict,
+    op: str = "",
+    inputs: list[SDSCArgs] | None = None,
 ) -> dict:
     # Reduction path: mask the stick dim being reduced (scale == -2), so the
     # padding lanes take the reduction identity.
@@ -320,7 +324,19 @@ def _get_coordinate_mask(
     # EVERY padded output dim so its lanes are contraction-neutral. In practice
     # SDPA pads only the stick dim, so this emits a single-dim mask; the multi-dim
     # case is unexercised (see the BANDAGE note on _PADDING_MASK_VALUES).
-    mask_pointwise = op in _POINTWISE_PADDING_OPS
+    #
+    # Skip the pointwise mask when an input is broadcast along a padded dim
+    # (scale != 1, e.g. x / x.sum(-1, keepdim=True)). SAMV then substitutes the
+    # mask value only into the inputs that iterate the dim, so realdiv computes
+    # inf / y == inf instead of 0. Worse, for some widths (e.g. 6 sticks) the
+    # backend applies the mask to valid lanes and corrupts the result,
+    # whatever the mask value. Unmasked, the valid lanes are correct.
+    mask_pointwise = op in _POINTWISE_PADDING_OPS and all(
+        inp.scales.get(dim) == 1
+        for inp in inputs or []
+        for dim, padding in dim_padding.items()
+        if padding > 0
+    )
     return {
         dim: [[iteration_space[dim] - padding, padding]]
         for dim, padding in dim_padding.items()
@@ -2366,7 +2382,7 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
         )
     coordinate_masking = _get_coordinate_mask(
-        sdsc_iteration_space, args[-1], padding, op_spec.op
+        sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
     )
     masking_const_id = -1
     if coordinate_masking:
