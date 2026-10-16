@@ -454,8 +454,7 @@ class TestForEachTileE2E(_DynamoResetTestCase):
         The index is a point read whose address advances with the spliced loop
         and has no iteration dim, so this drives
         coarse_tile._point_splice_advance_for_dep (record the per-trip
-        advance), _full_buffer_read_deps' point-read exclusion (leave the read
-        direct instead of staging a 1-element int32 into scratch),
+        advance), leave the read direct (never staged into scratch),
         _rebase_point_splice_reads (pin the index to iteration 0 so the
         advance is not applied twice), and insert_restickify's per-dep advance
         handover. Numerics, not just compilation: every one of those can be
@@ -931,7 +930,10 @@ class TestPrescribedRegionsE2E(_DynamoResetTestCase):
     def _compile(self, fn, *args):
         _CollectRegions.operations = []
         _CollectRegions.regions = []
-        with patch.object(ts_passes, "CustomPreSchedulingPasses", _CollectRegions):
+        with (
+            patch.object(ts_passes, "CustomPreSchedulingPasses", _CollectRegions),
+            torch._inductor.config.patch(force_disable_caches=True),
+        ):
             torch.compile(fn, backend="inductor", fullgraph=True)(*args)
         return _CollectRegions.operations, _CollectRegions.regions
 
