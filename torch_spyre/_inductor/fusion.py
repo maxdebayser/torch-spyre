@@ -53,9 +53,32 @@ def _is_fusable_node(node: BaseSchedulerNode) -> bool:
     )
 
 
-def group_contiguous_fusable(items: list, is_fusable: Callable) -> list[list]:
+def _is_hoistable_node(node: BaseSchedulerNode) -> bool:
+    """True if ``node`` may be moved ahead of the run being fused without
+    changing the program semantics.
+
+    ``NopKernelSchedulerNode``s generate no kernel, so emitting them before the
+    pending run keeps them from splitting the nodes before and after them into
+    separate bundles.
+    """
+    return isinstance(node, NopKernelSchedulerNode)
+
+
+def _never_hoistable(item) -> bool:
+    return False
+
+
+def group_contiguous_fusable(
+    items: list,
+    is_fusable: Callable,
+    is_hoistable: Callable = _never_hoistable,
+) -> list[list]:
     """Split ``items`` into maximal contiguous runs of fusable entries, with each
     non-fusable entry its own single-element run.
+
+    A non-fusable entry for which ``is_hoistable`` is true does not end the
+    current run: it is emitted as its own group ahead of the run, which then
+    continues past it.
 
     This is the *policy* behind :func:`spyre_fuse_nodes` -- one SuperDSC bundle
     per maximal run of fusable ops, order preserved -- factored out so that
@@ -72,9 +95,7 @@ def group_contiguous_fusable(items: list, is_fusable: Callable) -> list[list]:
         if is_fusable(item):
             run.append(item)
             continue
-        if len(run) > 0 and isinstance(item, NopKernelSchedulerNode):
-            # Reorder NopKernelSchedulerNodes because they prevent
-            # the fusion of nodes before and after them
+        if run and is_hoistable(item):
             groups.append([item])
             continue
         if run:
@@ -103,7 +124,7 @@ def spyre_fuse_nodes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
     # comes back as a single-element run, and ``_make_fused`` returns it
     # unchanged, so this preserves the previous behaviour exactly.
     fused_nodes: list[BaseSchedulerNode] = []
-    for group in group_contiguous_fusable(nodes, _is_fusable_node):
+    for group in group_contiguous_fusable(nodes, _is_fusable_node, _is_hoistable_node):
         if fused := _make_fused(group):
             fused_nodes.append(fused)
     return fused_nodes
@@ -154,4 +175,6 @@ def estimate_bundles(operations: Sequence) -> list[list]:
     """
     if not config.bundle_symbolic_args:
         return [[op] for op in operations]
-    return group_contiguous_fusable(list(operations), _is_fusable_operation)
+    return group_contiguous_fusable(
+        list(operations), _is_fusable_operation, _is_hoistable_node
+    )
