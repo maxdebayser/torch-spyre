@@ -9635,11 +9635,6 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         fn, call_args = _pattern_resolve(variant, args)
         atol, rtol = _PATTERN_TOL.get(variant, (0.1, 0.1))
-        # The ViT attention with a CLS token has an unaligned token dim. In eager
-        # mode the planner splits it across cores for the softmax kernel, and the
-        # backend cannot mask that (#5285), so dbo-opt rejects it. Compiled, the
-        # softmax ops are no longer pinned by the padding's offset write, so the
-        # co-optimizing allocator divides them over batch and heads instead.
         compare_with_cpu(
             fn,
             *call_args,
