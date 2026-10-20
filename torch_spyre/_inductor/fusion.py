@@ -14,7 +14,7 @@
 
 from collections.abc import Callable, Sequence
 
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, NopKernel
 from torch._inductor.scheduler import (
     BaseSchedulerNode,
     FusedSchedulerNode,
@@ -53,15 +53,47 @@ def _is_fusable_node(node: BaseSchedulerNode) -> bool:
     )
 
 
+def _is_vetted_nop(op) -> bool:
+    """True if the IR operation ``op`` is a no-op whose codegen only allocates.
+
+    The scheduler makes a ``NopKernelSchedulerNode`` from every operation whose
+    ``is_no_op()`` is true, and emits it as ``mark_run()``: an allocation of its
+    outputs, with none of its inputs read. Two kinds of operation take that path
+    today, and only these are accepted:
+
+    - a zero-element ``ComputedBuffer`` -- notably every ``empty``/
+      ``empty_strided`` result, the buffer that Spyre's ``cat`` and padding
+      lowerings then fill with ordinary copy kernels;
+    - a ``NopKernel`` (in practice ``ConcatKernel``), whose inputs are views
+      into its own storage.
+
+    A future ``is_no_op()`` kind is rejected until it is checked, so it falls
+    back to being a bundle boundary instead of being reordered.
+    """
+    if isinstance(op, NopKernel):
+        return True
+    return isinstance(op, ComputedBuffer) and op.is_no_op()
+
+
 def _is_hoistable_node(node: BaseSchedulerNode) -> bool:
     """True if ``node`` may be moved ahead of the run being fused without
     changing the program semantics.
 
-    ``NopKernelSchedulerNode``s generate no kernel, so emitting them before the
-    pending run keeps them from splitting the nodes before and after them into
+    A nop (see :func:`_is_vetted_nop`) generates no kernel, so emitting it before
+    the pending run keeps it from splitting the nodes before and after it into
     separate bundles.
+
+    Moving a nop earlier never puts it after one of its consumers. It may put it
+    ahead of a node it formally depends on -- a ``ConcatKernel`` carries a
+    ``StarDep`` on each buffer it concatenates -- so the result is not strictly
+    topological in the dependency graph. That is safe because no data flows
+    along those edges: a nop's codegen only allocates its outputs, and a
+    concat's inputs are views into that very allocation, so it has to come first
+    anyway. A zero-element buffer reads nothing at all. Buffer lifetimes are
+    recomputed from the new order afterwards (``Scheduler.compute_last_usage``
+    runs after the post-fusion passes).
     """
-    return isinstance(node, NopKernelSchedulerNode)
+    return isinstance(node, NopKernelSchedulerNode) and _is_vetted_nop(node.node)
 
 
 def _never_hoistable(item) -> bool:
@@ -140,7 +172,7 @@ def _is_fusable_operation(op) -> bool:
     made yet at this point in the pipeline.
 
     A zero-element ``ComputedBuffer`` is excluded: the scheduler turns it into a
-    ``NopKernelSchedulerNode`` (see :func:`_is_hoistable_operation`).
+    ``NopKernelSchedulerNode`` (see :func:`_is_vetted_nop`).
     """
     if not isinstance(op, ComputedBuffer) or op.is_no_op():
         return False
@@ -149,14 +181,9 @@ def _is_fusable_operation(op) -> bool:
 
 
 def _is_hoistable_operation(op) -> bool:
-    """The IR-operation analogue of :func:`_is_hoistable_node`.
-
-    The scheduler creates a ``NopKernelSchedulerNode`` for exactly the operations
-    whose ``is_no_op()`` is true -- a ``NopKernel`` such as ``ConcatKernel``, or a
-    zero-element ``ComputedBuffer`` -- so the same test predicts which operations
-    :func:`spyre_fuse_nodes` will hoist.
-    """
-    return op.is_no_op()
+    """The IR-operation analogue of :func:`_is_hoistable_node`: the operations
+    that will become a hoisted ``NopKernelSchedulerNode``."""
+    return _is_vetted_nop(op)
 
 
 def estimate_bundles(operations: Sequence) -> list[list]:

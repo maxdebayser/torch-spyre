@@ -178,6 +178,10 @@ class TestEstimateBundles(unittest.TestCase):
         ops = [_spyre("a"), _buffer("pad", DEVICE_NAME, True), _spyre("b")]
         self.assertEqual(_tags(estimate_bundles(ops)), [["pad"], ["a", "b"]])
 
+    def test_unvetted_nop_is_a_boundary(self):
+        ops = [_spyre("a"), _UnvettedNop("new"), _spyre("b")]
+        self.assertEqual(_tags(estimate_bundles(ops)), [["a"], ["new"], ["b"]])
+
     def test_fusion_off_gives_one_bundle_per_op(self):
         # The real pass leaves every node alone when bundling is off, so the
         # estimate must not claim a fusion that will not happen.
@@ -194,10 +198,24 @@ def _scheduler_node(tag: str) -> SchedulerNode:
     return node
 
 
-def _nop_node(tag: str) -> NopKernelSchedulerNode:
-    """A bare ``NopKernelSchedulerNode``: only the type is consulted."""
+class _UnvettedNop:
+    """Stands in for an IR kind whose ``is_no_op()`` is true but which is neither
+    a ``ComputedBuffer`` nor a ``NopKernel`` -- one a future PyTorch might add."""
+
+    def __init__(self, tag: str):
+        self.tag = tag
+
+    def is_no_op(self) -> bool:
+        return True
+
+
+def _nop_node(tag: str, op=None) -> NopKernelSchedulerNode:
+    """A bare ``NopKernelSchedulerNode`` wrapping ``op``, by default an empty
+    Spyre buffer (what ``lowering.empty`` produces): only the type and the
+    wrapped operation are consulted."""
     node = NopKernelSchedulerNode.__new__(NopKernelSchedulerNode)
     node.tag = tag
+    node.node = op if op is not None else _buffer(tag, DEVICE_NAME, True)
     return node
 
 
@@ -220,9 +238,28 @@ class TestHoistNopNodes(unittest.TestCase):
         ]
         self.assertEqual(self._group(nodes), [["nop"], ["a", "b", "c", "d"]])
 
+    def test_nop_at_end_of_run_is_hoisted(self):
+        # Intentional: a nop only allocates, so emitting it ahead of the run it
+        # follows is safe even with no fusable node after it.
+        nodes = [_scheduler_node("a"), _nop_node("nop")]
+        self.assertEqual(self._group(nodes), [["nop"], ["a"]])
+
     def test_nop_with_no_pending_run_stays_in_place(self):
         nodes = [_nop_node("nop"), _scheduler_node("a"), _scheduler_node("b")]
         self.assertEqual(self._group(nodes), [["nop"], ["a", "b"]])
+
+    def test_nop_kernel_is_hoisted(self):
+        nodes = [_scheduler_node("a"), _nop_node("cat", _nop_kernel("cat"))]
+        self.assertEqual(self._group(nodes), [["cat"], ["a"]])
+
+    def test_unvetted_nop_is_a_boundary(self):
+        # Only nops known to codegen as a bare allocation are reordered.
+        nodes = [
+            _scheduler_node("a"),
+            _nop_node("new", _UnvettedNop("new")),
+            _scheduler_node("b"),
+        ]
+        self.assertEqual(self._group(nodes), [["a"], ["new"], ["b"]])
 
 
 if __name__ == "__main__":
