@@ -18,6 +18,7 @@ Tests hook into CustomPreSchedulingPasses after insert_bmm_padding runs to inspe
 the operations list directly, without requiring end-to-end compilation to succeed.
 """
 
+import math
 import unittest
 from unittest.mock import patch
 from typing import Any, Callable, Optional, TypeVarTuple, Unpack, override
@@ -1069,6 +1070,20 @@ def full_half_stick(dtype: torch.dtype):
 
 COORD_MASK_DTYPES = [torch.float32, torch.float16]
 
+# Shapes with stick dimension that doesn't line up with stick size, i.e. requires padding
+SHAPES = [
+    (64, 8),
+    # multiple sticks get split by work division. Coordinate masking in combination with splitting wasn't supported by the backend copmpiler
+    (64, 100),
+]
+
+
+def unpad_shape(shape, dtype):
+    elems = get_elem_in_stick(dtype)
+    stick_dim = shape[-1]
+    unpadded = int(math.ceil(stick_dim / elems) * elems)
+    return (*shape[:-1], unpadded)
+
 
 @instantiate_parametrized_tests
 class TestCoordinateMasking(unittest.TestCase):
@@ -1079,20 +1094,23 @@ class TestCoordinateMasking(unittest.TestCase):
     """
 
     @parametrize("dtype", COORD_MASK_DTYPES)
-    def test_division(self, dtype) -> None:
-        full, half = full_half_stick(dtype)
-        a_spyre = torch.full((full, half), 2, dtype=dtype, device="spyre")
-        b_spyre = torch.full((full, half), 2, dtype=dtype, device="spyre")
+    @parametrize("shape", SHAPES)
+    def test_division(self, shape, dtype) -> None:
+        a_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
+        b_spyre = torch.full(shape, 2, dtype=dtype, device="spyre")
 
         def fn(x, y):
             return x / y
 
-        compiled = torch.compile(fn, fullgraph=True)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
         result = compiled(a_spyre, b_spyre)
 
-        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
-            :, half:
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
         ]
+        print(f"{exposed_padding.shape=}")
+        print(f"{exposed_padding=}")
         assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
@@ -1125,84 +1143,90 @@ class TestCoordinateMasking(unittest.TestCase):
         )
 
     @parametrize("dtype", COORD_MASK_DTYPES)
-    def test_exp(self, dtype) -> None:
-        full, half = full_half_stick(dtype)
-        a_spyre_full = torch.full((full, full), 222, dtype=dtype, device="spyre")
-        a_spyre = try_reinterpret_host_shape(a_spyre_full, (full, half))
+    @parametrize("shape", SHAPES)
+    def test_exp(self, shape, dtype) -> None:
+        unpadded = unpad_shape(shape, dtype)
+        a_spyre_full = torch.full(unpadded, 222, dtype=dtype, device="spyre")
+        a_spyre = try_reinterpret_host_shape(a_spyre_full, shape)
 
         def fn(x):
             return torch.exp(x)
 
-        compiled = torch.compile(fn, fullgraph=True)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
         result = compiled(a_spyre)
 
-        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
-            :, half:
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
         ]
         assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
-    def test_pow_neg(self, dtype) -> None:
-        full, half = full_half_stick(dtype)
-        a_spyre = torch.full((full, half), 0.5, dtype=dtype, device="spyre")
+    @parametrize("shape", SHAPES)
+    def test_pow_neg(self, shape, dtype) -> None:
+        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
 
         def fn(x):
             return torch.pow(x, -1.0)
 
-        compiled = torch.compile(fn, fullgraph=True)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
         result = compiled(a_spyre)
 
-        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
-            :, half:
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
         ]
         assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
-    def test_reciprocal(self, dtype) -> None:
-        full, half = full_half_stick(dtype)
-        a_spyre = torch.full((full, half), 0.5, dtype=dtype, device="spyre")
+    @parametrize("shape", SHAPES)
+    def test_reciprocal(self, shape, dtype) -> None:
+        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
 
         def fn(x):
             return torch.reciprocal(x)
 
-        compiled = torch.compile(fn, fullgraph=True)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
         result = compiled(a_spyre)
 
-        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
-            :, half:
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
         ]
         assert (exposed_padding == 0).all().item()
 
     @parametrize("dtype", COORD_MASK_DTYPES)
-    def test_rsqrt(self, dtype) -> None:
+    @parametrize("shape", SHAPES)
+    def test_rsqrt(self, shape, dtype) -> None:
         full, half = full_half_stick(dtype)
-        a_spyre = torch.full((full, half), 0.5, dtype=dtype, device="spyre")
+        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
 
         def fn(x):
             return torch.rsqrt(x)
 
-        compiled = torch.compile(fn, fullgraph=True)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
         result = compiled(a_spyre)
 
-        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
-            :, half:
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
         ]
         assert (exposed_padding < 1e-4).all().item()
 
     # Log is not supported on IEEE_FP32 yet
     @parametrize("dtype", [torch.float16])
-    def test_log(self, dtype) -> None:
-        full, half = full_half_stick(dtype)
-        a_spyre = torch.full((full, half), 0.5, dtype=dtype, device="spyre")
+    @parametrize("shape", SHAPES)
+    def test_log(self, shape, dtype) -> None:
+        a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")
 
         def fn(x):
             return torch.log(x)
 
-        compiled = torch.compile(fn, fullgraph=True)
+        compiled = torch.compile(fn, fullgraph=True, dynamic=False)
         result = compiled(a_spyre)
 
-        exposed_padding = try_reinterpret_host_shape(result, (full, full)).cpu()[
-            :, half:
+        unpadded = unpad_shape(shape, dtype)
+        exposed_padding = try_reinterpret_host_shape(result, unpadded).cpu()[
+            :, shape[-1] :
         ]
         assert (exposed_padding == 0).all().item()
 
