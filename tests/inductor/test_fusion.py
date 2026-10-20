@@ -27,7 +27,7 @@ since building real ones needs a compile.
 import unittest
 from unittest import mock
 import torch
-from torch._inductor.ir import ComputedBuffer
+from torch._inductor.ir import ComputedBuffer, NopKernel
 from torch._inductor.scheduler import NopKernelSchedulerNode, SchedulerNode
 from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import DEVICE_NAME
@@ -101,16 +101,19 @@ class TestGroupContiguousFusable(unittest.TestCase):
         self.assertEqual([item for group in groups for item in group], items)
 
 
-def _buffer(tag: str, device: str) -> ComputedBuffer:
+def _buffer(tag: str, device: str, zero_elements: bool = False) -> ComputedBuffer:
     """A bare ``ComputedBuffer`` carrying only what the grouping consults.
 
-    The grouping reads nothing but the type and the device, so the buffer needs no
-    layout or loop body -- just to satisfy the ``isinstance`` check and answer
-    ``get_device()``. ``tag`` identifies it in assertions.
+    The grouping reads nothing but the type, the device and ``is_no_op()``, so the
+    buffer needs no layout or loop body -- just to satisfy the ``isinstance``
+    check and answer those two calls. ``zero_elements`` stands in for a buffer
+    with no elements, which the scheduler turns into a
+    ``NopKernelSchedulerNode``. ``tag`` identifies it in assertions.
     """
     op = ComputedBuffer.__new__(ComputedBuffer)
     op.tag = tag
     op.get_device = lambda: torch.device(device)
+    op.is_no_op = lambda: zero_elements
     return op
 
 
@@ -128,6 +131,16 @@ class _Extern:
 
     def __init__(self, tag: str):
         self.tag = tag
+
+    def is_no_op(self) -> bool:
+        return False
+
+
+def _nop_kernel(tag: str) -> NopKernel:
+    """A bare ``NopKernel`` (e.g. the ``ConcatKernel`` behind ``cat``)."""
+    op = NopKernel.__new__(NopKernel)
+    op.tag = tag
+    return op
 
 
 def _tags(bundles) -> list[list[str]]:
@@ -153,6 +166,17 @@ class TestEstimateBundles(unittest.TestCase):
 
     def test_no_operations(self):
         self.assertEqual(estimate_bundles([]), [])
+
+    def test_nop_kernel_is_hoisted_ahead_of_the_run(self):
+        # ``spyre_fuse_nodes`` hoists the NopKernelSchedulerNode this becomes,
+        # so it must not split the estimate into [a] and [b].
+        ops = [_spyre("a"), _nop_kernel("cat"), _spyre("b")]
+        self.assertEqual(_tags(estimate_bundles(ops)), [["cat"], ["a", "b"]])
+
+    def test_zero_element_buffer_is_hoisted_not_fused(self):
+        # A Spyre ComputedBuffer with no elements is a nop, not a run member.
+        ops = [_spyre("a"), _buffer("pad", DEVICE_NAME, True), _spyre("b")]
+        self.assertEqual(_tags(estimate_bundles(ops)), [["pad"], ["a", "b"]])
 
     def test_fusion_off_gives_one_bundle_per_op(self):
         # The real pass leaves every node alone when bundling is off, so the

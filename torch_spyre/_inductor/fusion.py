@@ -138,11 +138,25 @@ def _is_fusable_operation(op) -> bool:
     op -- forces a bundle boundary. This is an *estimate*: whether a given
     operation ends up fused or extern is a scheduling decision that has not been
     made yet at this point in the pipeline.
+
+    A zero-element ``ComputedBuffer`` is excluded: the scheduler turns it into a
+    ``NopKernelSchedulerNode`` (see :func:`_is_hoistable_operation`).
     """
-    if not isinstance(op, ComputedBuffer):
+    if not isinstance(op, ComputedBuffer) or op.is_no_op():
         return False
     device = op.get_device()
     return device is not None and device.type == DEVICE_NAME
+
+
+def _is_hoistable_operation(op) -> bool:
+    """The IR-operation analogue of :func:`_is_hoistable_node`.
+
+    The scheduler creates a ``NopKernelSchedulerNode`` for exactly the operations
+    whose ``is_no_op()`` is true -- a ``NopKernel`` such as ``ConcatKernel``, or a
+    zero-element ``ComputedBuffer`` -- so the same test predicts which operations
+    :func:`spyre_fuse_nodes` will hoist.
+    """
+    return op.is_no_op()
 
 
 def estimate_bundles(operations: Sequence) -> list[list]:
@@ -176,5 +190,5 @@ def estimate_bundles(operations: Sequence) -> list[list]:
     if not config.bundle_symbolic_args:
         return [[op] for op in operations]
     return group_contiguous_fusable(
-        list(operations), _is_fusable_operation, _is_hoistable_node
+        list(operations), _is_fusable_operation, _is_hoistable_operation
     )
