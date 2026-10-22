@@ -271,6 +271,9 @@ _FP16_MIN = -65504.0
 # 16-bit halves are constructed directly from their bit patterns.
 _FP32_MIN = struct.unpack("<f", struct.pack("<I", 0xFF7FFF7F))[0]  # -3.40279751e38
 _FP32_MAX = struct.unpack("<f", struct.pack("<I", 0x7F7F7F7F))[0]  # 3.39617752e38
+_FP32_ALMOST_1 = struct.unpack("<f", struct.pack("<I", 0x3F803F80))[
+    0
+]  # 1.0019378662109375
 
 _PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
     "max": {
@@ -295,7 +298,7 @@ _PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
     },
     "log": {
         DataFormats.SEN169_FP16: 1,
-        DataFormats.IEEE_FP32: 1,
+        DataFormats.IEEE_FP32: _FP32_ALMOST_1,
     },
     "realdiv": {
         DataFormats.SEN169_FP16: float("inf"),
