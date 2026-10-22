@@ -1236,8 +1236,7 @@ class TestCoordinateMasking(unittest.TestCase):
         ]
         assert (exposed_padding < 1e-4).all().item()
 
-    # Log is not supported on IEEE_FP32 yet
-    @parametrize("dtype", [torch.float16])
+    @parametrize("dtype", COORD_MASK_DTYPES)
     @parametrize("shape", SHAPES)
     def test_log(self, shape, dtype) -> None:
         a_spyre = torch.full(shape, 0.5, dtype=dtype, device="spyre")

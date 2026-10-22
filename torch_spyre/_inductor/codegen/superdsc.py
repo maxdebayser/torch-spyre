@@ -295,7 +295,7 @@ _PADDING_MASK_VALUES: dict[str, dict[DataFormats, float]] = {
     },
     "log": {
         DataFormats.SEN169_FP16: 1,
-        # Log is not supported on IEEE_FP32 yet
+        DataFormats.IEEE_FP32: 1,
     },
     "realdiv": {
         DataFormats.SEN169_FP16: float("inf"),
