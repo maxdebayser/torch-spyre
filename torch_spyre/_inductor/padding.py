@@ -61,6 +61,7 @@ from sympy import FiniteSet, Interval, S, Set, oo
 
 import torch
 from sympy import Expr
+from torch._inductor.dtype_propagation import DtypePropagationOpsHandler
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     Buffer,
@@ -1109,7 +1110,6 @@ class DomainRangeTracer(DefaultHandler):
     def __init__(self):
         super().__init__()
         self.buffer_range: dict[str, Any] = dict[str, Set]()
-        self.buffer_dtype = dict[str, torch.dtype]()
         self.non_zero_reals = S.Reals - FiniteSet(0)
         self.positive_numbers = Interval(0, sympy.oo)
         self.stricty_positive_numbers = Interval(0, sympy.oo, left_open=True)
@@ -1216,11 +1216,7 @@ class DomainRangeTracer(DefaultHandler):
         return self._singleton_set_binary(lambda x, y: x == y, x0, x1, self.booleans)
 
     def exp(self, x0):
-        # For fp32, 88.8
-        domain = Interval(-sympy.oo, 11.05)
-        if not x0.is_subset(domain):
-            raise InvalidDomain(domain, "exp")
-        return self.positive_numbers
+        return self._unary_op(math.exp, x0, self.positive_numbers)
 
     def exx2(self, x, scale, useZeroMean):
         return self.positive_numbers
@@ -1276,12 +1272,12 @@ class DomainRangeTracer(DefaultHandler):
         return self._singleton_set_binary(operator.ne, x0, x1, self.booleans)
 
     def neg(self, x0: Set):
-        return self._unary_op(x0, operator.neg, S.Reals)
+        return self._unary_op(operator.neg, x0, S.Reals)
 
     def reciprocal(self, x0):
         if not x0.is_subset(self.non_zero_reals):
             raise InvalidDomain(self.non_zero_reals, "reciprocal")
-        return self._unary_op(x0, lambda x: 1 / x, self.non_zero_reals)
+        return self._unary_op(lambda x: 1 / x, x0, self.non_zero_reals)
 
     def qfp8ch(self, x):
         return x
@@ -1293,40 +1289,40 @@ class DomainRangeTracer(DefaultHandler):
         return self.positive_numbers
 
     def relu(self, x0):
-        self._unary_op(x0, lambda x: max(x, 0.0), self.positive_numbers)
+        return self._unary_op(lambda x: max(x, 0.0), x0, self.positive_numbers)
 
     def rsqrt(self, x0):
         if not x0.is_subset(self.stricty_positive_numbers):
             raise InvalidDomain(self.stricty_positive_numbers, "rsqrt")
         return self._unary_op(
-            x0, lambda x: 1 / math.sqrt(x), self.stricty_positive_numbers
+            lambda x: 1 / math.sqrt(x), x0, self.stricty_positive_numbers
         )
 
     def sigmoid(self, x0):
         return self._unary_op(
-            x0, _sigmoid, Interval(0, 1, left_open=True, right_open=True)
+            _sigmoid, x0, Interval(0, 1, left_open=True, right_open=True)
         )
 
     def softplus(self, x, beta, threshold):
         def sp(x):
             return (1.0 / beta) * math.log(1.0 + math.exp(beta * x))
 
-        return self._unary_op(x, sp, Interval(-0.278, sympy.oo))
+        return self._unary_op(sp, x, Interval(-0.278, sympy.oo))
 
     def sqrt(self, x0):
         if not x0.is_subset(self.positive_numbers):
             raise InvalidDomain(self.positive_numbers, "rsqrt")
-        return self._unary_op(x0, math.sqrt, self.positive_numbers)
+        return self._unary_op(math.sqrt, x0, self.positive_numbers)
 
     def square(self, x0):
-        return self._unary_op(x0, lambda x: x * x, self.positive_numbers)
+        return self._unary_op(lambda x: x * x, x0, self.positive_numbers)
 
     def sub(self, x0, x1):
         return self._binary_op(operator.sub, x0, x1)
 
     def tanh(self, x0):
         return self._unary_op(
-            x0, math.tanh, Interval(-1, 1, left_open=True, right_open=True)
+            math.tanh, x0, Interval(-1, 1, left_open=True, right_open=True)
         )
 
     def to_dtype(self, x, dtype, src_dtype=None, use_compute_types=False):
@@ -1339,10 +1335,84 @@ class DomainRangeTracer(DefaultHandler):
         return self._binary_op(operator.truediv, x0, x1)
 
     def silu(self, x0):
-        return self._unary_op(x0, lambda x: x * _sigmoid(x), Interval(-0.278, sympy.oo))
+        return self._unary_op(lambda x: x * _sigmoid(x), x0, Interval(-0.278, sympy.oo))
 
     def where(self, condition, input, other):
         return input.union(other)
+
+
+@dataclasses.dataclass(frozen=True)
+class SetDtype:
+    set: Set
+    dtype: torch.dtype | None
+
+
+class SetDtypeTracer(DefaultHandler):
+    """Run DomainRangeTracer and DtypePropagationOpsHandler side by side.
+
+    Some operations like exp() can have special limitations depending on
+    the Dtype. This handler wraps the DomainRangeTracer which operates on
+    a purely mathematical level of abstraction.
+    """
+
+    name = "SetDtypeTracer"
+
+    def __init__(self, tracer: DomainRangeTracer):
+        super().__init__()
+        self.tracer = tracer
+        self.dtype_rules = DtypePropagationOpsHandler()
+
+    @staticmethod
+    def _sets(x):
+        if isinstance(x, SetDtype):
+            return x.set
+        if isinstance(x, (tuple, list)):
+            return type(x)(SetDtypeTracer._sets(e) for e in x)
+        return x
+
+    def _dtype(self, name: str, args, kwargs) -> Any:
+        values = [*args, *kwargs.values()]
+        if any(isinstance(v, SetDtype) and v.dtype is None for v in values):
+            return None
+        rule = getattr(self.dtype_rules, name, None)
+        if rule is None:
+            return None
+        try:
+            return rule(*args, **kwargs)
+        except (AssertionError, AttributeError, TypeError):
+            # A rule that cannot handle these args (e.g. a list of indices
+            # passed to promote_types) leaves the dtype unknown; only
+            # dtype-dependent domains need it.
+            return None
+
+    @staticmethod
+    def _wrap(r, dtype):
+        if isinstance(r, Set):
+            return SetDtype(r, dtype)
+        if isinstance(r, tuple):
+            dtypes = dtype if isinstance(dtype, tuple) else (dtype,) * len(r)
+            return tuple(SetDtypeTracer._wrap(e, d) for e, d in zip(r, dtypes))
+        return r
+
+    def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]):
+        r = getattr(self.tracer, name)(
+            *self._sets(args), **{k: self._sets(v) for k, v in kwargs.items()}
+        )
+        if not isinstance(r, (Set, tuple)):
+            return r
+        return self._wrap(r, self._dtype(name, args, kwargs))
+
+    def load(self, name: str, index: sympy.Expr) -> SetDtype:
+        return SetDtype(self.tracer.load(name, index), V.graph.get_dtype(name))
+
+    def exp(self, x0) -> SetDtype:
+        # exp overflows above log(max finite value): ~11.09 for fp16, ~88.72
+        # for fp32. An unknown dtype gets the narrower fp16 domain.
+        upper = 88.7 if x0.dtype == torch.float32 else 11.05
+        domain = Interval(-sympy.oo, upper)
+        if not x0.is_subset(domain):
+            raise InvalidDomain(domain, "exp")
+        return self._default("exp", args=(x0,), kwargs={})
 
 
 # TODO, refactor the lines below when 5409 is merged
@@ -1452,7 +1522,7 @@ def track_padding_value(graph: GraphLowering) -> None:
     operations = graph.operations
 
     tracer = DomainRangeTracer()
-    with V.set_ops_handler(tracer):
+    with V.set_ops_handler(SetDtypeTracer(tracer)):
         for op in list(operations):
             reads = op.get_read_writes().reads
 
@@ -1501,7 +1571,7 @@ def track_padding_value(graph: GraphLowering) -> None:
 
                     required_padding = FiniteSet(0)
                     if reduction != "batchmatmul" and (
-                        pad := get_pad_value(reduction, op.layout.dtype) is not None
+                        (pad := get_pad_value(reduction, op.layout.dtype)) is not None
                     ):
                         required_padding = FiniteSet(pad)
 
@@ -1527,8 +1597,8 @@ def track_padding_value(graph: GraphLowering) -> None:
                     try:
                         ranges = op.data.ranges
                         syms = _index_syms(len(ranges))
-                        tracer.buffer_range[op.name] = OpsWrapper._unwrap(
-                            op.data.inner_fn(syms)
+                        tracer.buffer_range[op.name] = SetDtypeTracer._sets(
+                            OpsWrapper._unwrap(op.data.inner_fn(syms))
                         )
                         op.annotations["do_coord_mask"] = False
                         op.annotations["do_pad"] = False
