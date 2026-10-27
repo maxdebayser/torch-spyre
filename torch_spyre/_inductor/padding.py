@@ -53,6 +53,8 @@ M=1 (decode phase) correctly.
 from typing import Any, Union
 import dataclasses
 import struct
+import math
+import operator
 
 import sympy
 from sympy import FiniteSet, Interval, S, Set, oo
@@ -1081,7 +1083,27 @@ class InvalidDomain(Exception):
         self.arg_index = arg_index
 
 
+def _sigmoid(x):
+    return 1.0 / (1.0 + math.exp(-x))
+
+
 class DomainRangeTracer(DefaultHandler):
+    """
+    Validates input set and propagate to image.
+
+    Each function receives as input a sympy Set for each argument, which stands
+    for the possible values that can be in the tensor's padding, if any. This input
+    set has to be a subset of the Domain or else an InvalidDomain exception is
+    raised. This exception is a signal that we must set a specific padding value.
+
+    The functions are free to return the codomain of the function, e.g. the real numbers,
+    but we want to narrow it down at the very least to the range of the function, e.g.
+    positive real numbers. Where possible, for example for some unary or binary
+    operations on FiniteSets or Intervals, we might be able to return the image.
+    For example FiniteSet(0) represents the default zero-padding and for most
+    functions it's trivial to return the image of {0}.
+    """
+
     name = "DomainRangeTracer"
 
     def __init__(self):
@@ -1115,20 +1137,83 @@ class DomainRangeTracer(DefaultHandler):
             raise ValueError(f"Expected range of buffer {name} to be known")
         return buf_range
 
-    def abs(self, x0):
-        return self.positive_numbers
+    # only valid for monotonic functions
+    def _unary_op(self, op, x0, fallback_set=None):
+        if isinstance(x0, FiniteSet):
+            return FiniteSet(*(op(e) for e in x0))
+        elif isinstance(x0, Interval):
+            _start = (op(x0.inf), x0.left_open)
+            _end = (op(x0.sup), x0.right_open)
+            if _start[0] > _end[0]:
+                _start, _end = _end, _start
+            return Interval(_start[0], _end[0], left_open=_start[1], right_open=_end[1])
+        if fallback_set is not None:
+            return fallback_set
+        return x0
 
-    def add(self, x0, x1):
+    def _singleton_set_binary(self, op, x0, x1, fallback_set):
+        if (
+            isinstance(x0, FiniteSet)
+            and len(x0) == 1
+            and isinstance(x1, FiniteSet)
+            and len(x1) == 1
+        ):
+            return FiniteSet(op(x0.args[0], x1.args[0]))
+
+    def _binary_op(self, op, x0, x1, output_set=None):
+        # Like _unary_op, assumes op is monotonic in each argument, so the
+        # extremes of the result lie at the corners of the input bounds.
+        if isinstance(x0, FiniteSet) and isinstance(x1, FiniteSet):
+            return FiniteSet(*(op(a, b) for a in x0 for b in x1))
+
+        def pieces(x):
+            # Each piece is a pair of (bound, open) endpoints.
+            if isinstance(x, FiniteSet):
+                return [((e, False), (e, False)) for e in x]
+            return [((x.inf, x.left_open), (x.sup, x.right_open))]
+
+        if isinstance(x0, (FiniteSet, Interval)) and isinstance(
+            x1, (FiniteSet, Interval)
+        ):
+            result = S.EmptySet
+            for a_lo, a_hi in pieces(x0):
+                for b_lo, b_hi in pieces(x1):
+                    corners = [
+                        (sympy.sympify(op(a[0], b[0])), a[1] or b[1])
+                        for a in (a_lo, a_hi)
+                        for b in (b_lo, b_hi)
+                    ]
+                    if any(v is sympy.nan for v, _ in corners):
+                        return output_set if output_set is not None else x0.union(x1)
+                    lo = min(v for v, _ in corners)
+                    hi = max(v for v, _ in corners)
+                    # A bound is open only if every corner reaching it is open.
+                    lo_open = all(o for v, o in corners if v == lo)
+                    hi_open = all(o for v, o in corners if v == hi)
+                    result = result.union(
+                        Interval(lo, hi, left_open=lo_open, right_open=hi_open)
+                    )
+            return result
+        if output_set is not None:
+            return output_set
         return x0.union(x1)
 
+    def abs(self, x0):
+        return self._unary_op(math.fabs, x0, self.positive_numbers)
+
+    def add(self, x0, x1):
+        return self._binary_op(operator.add, x0, x1)
+
     def clamp(self, x, min=None, max=None):
-        return Interval(
-            min if min is not None else -sympy.oo,
-            max if max is not None else sympy.oo,
+        return x.intersection(
+            Interval(
+                min if min is not None else -sympy.oo,
+                max if max is not None else sympy.oo,
+            )
         )
 
     def eq(self, x0, x1):
-        return self.booleans
+        return self._singleton_set_binary(lambda x, y: x == y, x0, x1, self.booleans)
 
     def exp(self, x0):
         # For fp32, 88.8
@@ -1144,13 +1229,13 @@ class DomainRangeTracer(DefaultHandler):
         return x0.intersection(S.Integers)
 
     def ge(self, x0, x1):
-        return self.booleans
+        return self._singleton_set_binary(operator.ge, x0, x1, self.booleans)
 
     def gelu(self, x):
         return Interval(-0.17, sympy.oo)
 
     def gt(self, x0, x1):
-        return self.booleans
+        return self._singleton_set_binary(operator.gt, x0, x1, self.booleans)
 
     def keep_by_index(self, x, indices):
         return x
@@ -1167,41 +1252,36 @@ class DomainRangeTracer(DefaultHandler):
         return S.Reals
 
     def le(self, x0, x1):
-        return self.booleans
+        return self._singleton_set_binary(operator.le, x0, x1, self.booleans)
 
     def logical_and(self, x0, x1):
-        return self.booleans
+        return self._singleton_set_binary(operator.and_, x0, x1, self.booleans)
 
     def logical_or(self, x0, x1):
-        return self.booleans
+        return self._singleton_set_binary(operator.or_, x0, x1, self.booleans)
 
     def lt(self, x0, x1):
-        return self.booleans
+        return self._singleton_set_binary(operator.lt, x0, x1, self.booleans)
 
     def maximum(self, x0, x1):
-        return x0.union(x1)
+        return self._binary_op(max, x0, x1)
 
     def minimum(self, x0, x1):
-        return x0.union(x1)
+        return self._binary_op(min, x0, x1)
 
     def mul(self, x0, x1):
-        return x0.union(x1)
+        return self._binary_op(operator.mul, x0, x1)
 
     def ne(self, x0, x1):
-        return self.booleans
+        return self._singleton_set_binary(operator.ne, x0, x1, self.booleans)
 
     def neg(self, x0: Set):
-        if isinstance(x0, FiniteSet):
-            return FiniteSet(*(-n for n in x0))
-        if isinstance(x0, Interval):
-            low, up = x0.inf, x0.sup
-            Interval(-up, -low, left_open=x0.right_open, right_open=x0.left_open)
-        return S.Reals
+        return self._unary_op(x0, operator.neg, S.Reals)
 
     def reciprocal(self, x0):
         if not x0.is_subset(self.non_zero_reals):
             raise InvalidDomain(self.non_zero_reals, "reciprocal")
-        return self.non_zero_reals
+        return self._unary_op(x0, lambda x: 1 / x, self.non_zero_reals)
 
     def qfp8ch(self, x):
         return x
@@ -1213,30 +1293,41 @@ class DomainRangeTracer(DefaultHandler):
         return self.positive_numbers
 
     def relu(self, x0):
-        return x0
+        self._unary_op(x0, lambda x: max(x, 0.0), self.positive_numbers)
 
     def rsqrt(self, x0):
-        if not x0.is_subset(self.non_zero_reals):
-            raise InvalidDomain(self.non_zero_reals, "rsqrt")
-        return self.non_zero_reals
+        if not x0.is_subset(self.stricty_positive_numbers):
+            raise InvalidDomain(self.stricty_positive_numbers, "rsqrt")
+        return self._unary_op(
+            x0, lambda x: 1 / math.sqrt(x), self.stricty_positive_numbers
+        )
 
     def sigmoid(self, x0):
-        return Interval(0, 1, left_open=True, right_open=True)
+        return self._unary_op(
+            x0, _sigmoid, Interval(0, 1, left_open=True, right_open=True)
+        )
 
     def softplus(self, x, beta, threshold):
-        return (1 / beta) * sympy.log(1 + sympy.exp(beta * x))
+        def sp(x):
+            return (1.0 / beta) * math.log(1.0 + math.exp(beta * x))
+
+        return self._unary_op(x, sp, Interval(-0.278, sympy.oo))
 
     def sqrt(self, x0):
-        return self.positive_numbers
+        if not x0.is_subset(self.positive_numbers):
+            raise InvalidDomain(self.positive_numbers, "rsqrt")
+        return self._unary_op(x0, math.sqrt, self.positive_numbers)
 
     def square(self, x0):
-        return self.positive_numbers
+        return self._unary_op(x0, lambda x: x * x, self.positive_numbers)
 
     def sub(self, x0, x1):
-        return x0.union(x1)
+        return self._binary_op(operator.sub, x0, x1)
 
     def tanh(self, x0):
-        return Interval(-1, 1, left_open=True, right_open=True)
+        return self._unary_op(
+            x0, math.tanh, Interval(-1, 1, left_open=True, right_open=True)
+        )
 
     def to_dtype(self, x, dtype, src_dtype=None, use_compute_types=False):
         return x
@@ -1245,10 +1336,10 @@ class DomainRangeTracer(DefaultHandler):
         if not x1.is_subset(self.non_zero_reals):
             # realdiv is the correct key in _PADDING_MASK_VALUES
             raise InvalidDomain(self.non_zero_reals, "realdiv", arg_index=1)
-        return x0.union(x1)
+        return self._binary_op(operator.truediv, x0, x1)
 
     def silu(self, x0):
-        return x0
+        return self._unary_op(x0, lambda x: x * _sigmoid(x), Interval(-0.278, sympy.oo))
 
     def where(self, condition, input, other):
         return input.union(other)
@@ -1404,7 +1495,7 @@ def track_padding_value(graph: GraphLowering) -> None:
                     raise ValueError(f"Unhandled kind of node {op}")
 
             # Instead of while True
-            for i in range(1000):
+            for i in range(100):
                 if isinstance(op.data, Reduction):
                     reduction = op.data.reduction_type
 
