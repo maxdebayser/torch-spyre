@@ -1530,7 +1530,7 @@ class SetDtypeTracer(DefaultHandler):
         # for fp32. An unknown dtype gets the narrower fp16 domain.
         upper = 88.7 if x0.dtype == torch.float32 else 11.05
         domain = Interval(-sympy.oo, upper)
-        if not x0.is_subset(domain):
+        if not x0.set.is_subset(domain):
             raise InvalidDomain(domain, "exp")
         return self._default("exp", args=(x0,), kwargs={})
 
