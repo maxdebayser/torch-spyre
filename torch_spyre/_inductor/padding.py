@@ -1668,12 +1668,6 @@ def track_padding_value(graph: GraphLowering) -> None:
                 if isinstance(op, SpyreConstantFallback):
                     tracer.buffer_range[op.name] = FiniteSet(op.constant_args[0])
                     continue
-                elif isinstance(op, SpyreEmptyFallback):
-                    _range = S.Reals
-                    if padding_strict_mode:
-                        _range = _range.union(FiniteSet(S.NaN))
-                    tracer.buffer_range[op.name] = _range
-                    continue
                 elif isinstance(
                     op,
                     (
@@ -1681,9 +1675,17 @@ def track_padding_value(graph: GraphLowering) -> None:
                         AllGatherAsyncFallback,
                         AllReduceAsyncFallback,
                         WaitWorkFallback,
+                        SpyreEmptyFallback,
                     ),
                 ):
-                    raise NotImplementedError("todo")
+                    # Each collective behaves a bit differently wrt. to padding,
+                    # but the fact is that we don't know what is being read from
+                    # other processes, so for now it's better to be conservative.
+                    _range = S.Reals
+                    if padding_strict_mode:
+                        _range = _range.union(FiniteSet(S.NaN))
+                    tracer.buffer_range[op.name] = _range
+                    continue
                 else:
                     raise ValueError(f"Unhandled kind of node {op}")
 
