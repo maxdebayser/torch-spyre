@@ -22,7 +22,10 @@
 #include <util/sendefs/numeric_convert.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <iomanip>
+#include <limits>
 #include <map>
 #include <string>
 #include <utility>
@@ -204,11 +207,17 @@ std::string SpyreTensorLayout::toString() const {
     ss << "): " << size;
   }
   ss << "}";
-  if (this->padding != PADDING::UNINITIALIZED) {
-    ss << ", padding=PADDING." << spyre::paddingToString(this->padding);
-    auto value = this->constant_padding_value();
-    if (value.has_value()) {
-      ss << "(" << *value << ")";
+  // Emitted as a constructor keyword so that repr() round-trips through eval()
+  // in generated wrapper code.
+  if (auto value = this->constant_padding_value(); value.has_value()) {
+    ss << ", padding_value=";
+    if (std::isnan(*value)) {
+      ss << "float('nan')";
+    } else if (std::isinf(*value)) {
+      ss << (*value > 0 ? "float('inf')" : "float('-inf')");
+    } else {
+      ss << std::setprecision(std::numeric_limits<double>::max_digits10)
+         << *value;
     }
   }
   ss << ")";

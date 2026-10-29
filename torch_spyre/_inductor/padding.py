@@ -75,7 +75,7 @@ from torch._inductor.ir import (
     MutableBox,
 )
 from torch._inductor.ops_handler import DefaultHandler, WrapperHandler
-from torch._inductor.virtualized import V, OpsWrapper
+from torch._inductor.virtualized import V
 
 from .constants import BATCH_MATMUL_FP8_OP, BATCH_MATMUL_OP
 from .errors import Unsupported
@@ -1109,7 +1109,11 @@ class DomainRangeTracer(DefaultHandler):
 
     def __init__(self):
         super().__init__()
-        self.buffer_range: dict[str, Any] = dict[str, Set]()
+        self.current_op: str | None = None
+        # buffer name -> output set
+        self.buffer_range = dict[str, Set]()
+        # op name -> (arg name -> adjusted )
+        self.buffer_input = dict[str, dict[str, Set]]()
         self.non_zero_reals = S.Reals - FiniteSet(0)
         self.positive_numbers = Interval(0, sympy.oo)
         self.stricty_positive_numbers = Interval(0, sympy.oo, left_open=True)
@@ -1132,10 +1136,63 @@ class DomainRangeTracer(DefaultHandler):
         return sympy.Symbol("dummy")
 
     def load(self, name: str, index: sympy.Expr) -> Set:
-        buf_range = self.buffer_range.get(name)
-        if buf_range is None:
+        assert self.current_op is not None
+
+        padding_range = None
+        if (overwrites := self.buffer_input.get(self.current_op.name)) is not None:
+            if (val := overwrites.get(name)) is not None:
+                padding_range = val
+        else:
+            self.buffer_input[self.current_op.name] = {}
+
+        if padding_range is None:
+            padding_range = self.buffer_range.get(name)
+        if padding_range is None:
             raise ValueError(f"Expected range of buffer {name} to be known")
-        return buf_range
+        return padding_range
+
+    def store(
+        self,
+        name: str,
+        index: sympy.Expr,
+        value: Set,
+        mode=None,
+    ) -> None:
+        self.buffer_range[name] = value
+
+    def reduction(
+        self,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype,
+        reduction_type,
+        value: Set | tuple[Set, Set],
+    ) -> Set:
+        required_padding = FiniteSet(0)
+        if reduction_type != "batchmatmul":
+            if (pad := get_pad_value(reduction_type, dtype)) is not None:
+                required_padding = FiniteSet(pad)
+
+            assert isinstance(value, Set)
+
+            if not value.is_subset(required_padding):
+                raise InvalidDomain(required_padding, reduction_type)
+
+        else:
+            assert isinstance(value, tuple) and len(value) == 2
+
+            # at least one of the paddings has to be zero
+            if not any(v.is_subset(required_padding) for v in value):
+                # TODO: verify which choice is optimal.
+                raise InvalidDomain(required_padding, reduction_type, arg_index=0)
+
+        if reduction_type == "batchmatmul":
+            return FiniteSet(0)
+        else:
+            # other reductions can leave some garbage in padding
+            return S.Reals
+
+    def store_reduction(self, name: str, index: sympy.Expr, value: Set) -> None:
+        self.buffer_range[name] = value
 
     # only valid for monotonic functions
     def _unary_op(self, op, x0, fallback_set=None):
@@ -1405,6 +1462,9 @@ class SetDtypeTracer(DefaultHandler):
     def load(self, name: str, index: sympy.Expr) -> SetDtype:
         return SetDtype(self.tracer.load(name, index), V.graph.get_dtype(name))
 
+    def constant(self, value: Union[bool, float, int], dtype: torch.dtype) -> Set:
+        return self._wrap(self.tracer.constant(value, dtype), dtype)
+
     def exp(self, x0) -> SetDtype:
         # exp overflows above log(max finite value): ~11.09 for fp16, ~88.72
         # for fp32. An unknown dtype gets the narrower fp16 domain.
@@ -1496,6 +1556,8 @@ def pick_element(s: Set):
 
 
 def get_pad_value(func, dtype) -> float | None:
+    if func == "batchmatmul":
+        return 0
     if func == "indirect_indexing":
         return 0
     if dtype == torch.float16:
@@ -1508,7 +1570,7 @@ def get_pad_value(func, dtype) -> float | None:
 
 
 def can_coord_mask(func_name, dtype) -> bool:
-    if func_name in _POINTWISE_PADDING_OPS:
+    if func_name in _PADDING_MASK_VALUES:
         return get_pad_value(func_name, dtype) is not None
     return False
 
@@ -1524,6 +1586,7 @@ def track_padding_value(graph: GraphLowering) -> None:
     tracer = DomainRangeTracer()
     with V.set_ops_handler(SetDtypeTracer(tracer)):
         for op in list(operations):
+            tracer.current_op = op
             reads = op.get_read_writes().reads
 
             input_buffers = list[tuple[str, Buffer]]()
@@ -1564,79 +1627,60 @@ def track_padding_value(graph: GraphLowering) -> None:
                 else:
                     raise ValueError(f"Unhandled kind of node {op}")
 
-            # Instead of while True
+            op.annotations["do_coord_mask"] = False
+            op.annotations["do_pad"] = False
+
+            # Loop until we can either allow the inputs to pass unmodified or
+            # find a suitable padding. So the max iteration count is 1 for the
+            # first try and 1 retry for each argument
             for i in range(100):
-                if isinstance(op.data, Reduction):
-                    reduction = op.data.reduction_type
-
-                    required_padding = FiniteSet(0)
-                    if reduction != "batchmatmul" and (
-                        (pad := get_pad_value(reduction, op.layout.dtype)) is not None
-                    ):
-                        required_padding = FiniteSet(pad)
-
-                    op.annotations["do_coord_mask"] = False
-                    op.annotations["do_pad"] = False
-
-                    for name, buf in input_buffers:
-                        if required_padding != tracer.buffer_range[name]:
-                            if reduction == "batchmatmul":
-                                # assuming for now that we can't coord mask a matmul
-                                op.annotations["do_pad"] = True
-                                tracer.buffer_range[name] = required_padding
-                            else:
-                                op.annotations["do_coord_mask"] = True
-
-                    if reduction == "batchmatmul":
-                        tracer.buffer_range[op.name] = FiniteSet(0)
-                    else:
-                        # other reductions can leave some garbage in padding
-                        tracer.buffer_range[op.name] = S.Reals
-                    break
-                else:
-                    try:
-                        ranges = op.data.ranges
-                        syms = _index_syms(len(ranges))
-                        tracer.buffer_range[op.name] = SetDtypeTracer._sets(
-                            OpsWrapper._unwrap(op.data.inner_fn(syms))
+                ranges = op.data.ranges
+                syms = _index_syms(len(ranges))
+                try:
+                    store_fn = op.get_store_function()
+                    if isinstance(op.data, Reduction):
+                        r_ranges = op.data.reduction_ranges
+                        r_syms = tuple(
+                            sympy.Symbol(f"_r{k}") for k in range(len(r_ranges))
                         )
-                        op.annotations["do_coord_mask"] = False
-                        op.annotations["do_pad"] = False
-                        break
-                    except InvalidDomain as inv_domain:
-                        name, buf = input_buffers[inv_domain.arg_index]
+                        store_fn(syms, r_syms)
+                    else:
+                        store_fn(syms)
+                    break
+                except InvalidDomain as inv_domain:
+                    name, buf = input_buffers[inv_domain.arg_index]
 
-                        if can_coord_mask(inv_domain.func, buf.layout.dtype):
-                            op.annotations["do_coord_mask"] = True
-                            op.annotations["do_pad"] = False
-                            # For now this is true for all operations that are padded
+                    if can_coord_mask(inv_domain.func, buf.layout.dtype):
+                        op.annotations["do_coord_mask"] = True
+                        # For now this is true for all operations that are padded
+                        if op.layout.dtype == torch.float16:
+                            tracer.buffer_range[op.name] = FiniteSet(0)
+                        else:
                             tracer.buffer_range[op.name] = Interval(0, 1e-2)
-                            break
-
-                        pad_value = get_pad_value(inv_domain.func, buf.layout.dtype)
-                        if pad_value is None or not inv_domain.domain.contains(
-                            pad_value
-                        ):
-                            try:
-                                pad_value = pick_element(inv_domain.domain)
-                            except ValueError:
-                                raise ValueError(
-                                    f"Could not find legal pad for input {name} of {op.name}:{inv_domain.func}"
-                                )
-
-                        tracer.buffer_range[name] = FiniteSet(pad_value)
-                        op.annotations["do_coord_mask"] = False
+                    else:
                         op.annotations["do_pad"] = True
+
+                    pad_value = get_pad_value(inv_domain.func, buf.layout.dtype)
+                    if pad_value is None or not inv_domain.domain.contains(pad_value):
+                        try:
+                            pad_value = pick_element(inv_domain.domain)
+                        except ValueError:
+                            # TODO: ideally we don't want to raise here if there is no padding
+                            raise ValueError(
+                                f"Could not find legal pad for input {name} of {op.name}:{inv_domain.func}"
+                            )
+                    tracer.buffer_input[op.name][name] = FiniteSet(pad_value)
+
             else:
                 raise ValueError("Infinite loop")
 
-    # Finalize the padding
-    for op in list(operations):
-        if op.annotations.get("do_coord_mask", False) or op.annotations.get(
-            "do_pad", False
-        ):
-            pad_set = tracer.buffer_range[op.name]
-            if isinstance(pad_set, FiniteSet):
-                op.annotations["pad_value"] = min(pad_set)
-            else:
-                op.annotations["pad_value"] = pick_element(pad_set)
+            if op.annotations.get("do_coord_mask", False) or op.annotations.get(
+                "do_pad", False
+            ):
+                pad_set = tracer.buffer_range[op.name]
+                op.annotations["pad_value"] = float(pick_element(pad_set))
+
+                input_pad_values = dict[str, float]()
+                for arg_name, pad_set in tracer.buffer_input[op.name].items():
+                    input_pad_values[arg_name] = float(pick_element(pad_set))
+                op.annotations["pad_values"] = input_pad_values

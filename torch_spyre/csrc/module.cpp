@@ -352,13 +352,24 @@ PYBIND11_MODULE(_C, m) {
            py::arg("dim_order"),
            py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD)
       .def(
-          py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
-                   spyre::ElementArrangement,
-                   std::map<std::vector<int64_t>, int64_t>>(),
+          py::init([](std::vector<int64_t> device_size,
+                      std::vector<int64_t> stride_map, DataFormats device_dtype,
+                      spyre::ElementArrangement element_arrangement,
+                      std::map<std::vector<int64_t>, int64_t> valid_elements,
+                      std::optional<double> padding_value) {
+            spyre::SpyreTensorLayout stl(
+                std::move(device_size), std::move(stride_map), device_dtype,
+                element_arrangement, std::move(valid_elements));
+            if (padding_value.has_value()) {
+              stl.set_constant_padding(*padding_value);
+            }
+            return stl;
+          }),
           py::arg("device_size"), py::arg("stride_map"),
           py::arg("device_dtype"),
           py::arg("element_arrangement") = spyre::ElementArrangement::STANDARD,
-          py::arg("valid_elements") = std::map<std::vector<int64_t>, int64_t>{})
+          py::arg("valid_elements") = std::map<std::vector<int64_t>, int64_t>{},
+          py::arg("padding_value") = py::none())
       .def(py::init<std::vector<int64_t>, std::vector<int64_t>, DataFormats,
                     std::map<std::vector<int64_t>, int64_t>,
                     spyre::ElementArrangement>(),
