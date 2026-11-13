@@ -25,6 +25,7 @@ from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats, ElementArrangement
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.constants import (
+    BATCH_MATMUL_OP,
     CONV2D_DIM_LABELS,
     CONV2D_FWD_OP,
     CONV2D_LAYOUT_LABELS,
@@ -327,13 +328,57 @@ def _get_mask_value(
     return _PADDING_MASK_VALUES.get(op, {}).get(data_format, 0.0)
 
 
+def _get_matmul_coordinate_mask(
+    iteration_space: dict,
+    arg: SDSCArgs,
+    dim_padding: dict,
+    inputs: list[SDSCArgs],
+    symbolic_dim_names: Iterable[str],
+) -> dict:
+    """Mask the pure-padding columns of a matmul's kernel with 0.
+
+    The masked dim is the output column dim N (``out``): it is iterated by the
+    output and the kernel (second operand) but not by the activation. The
+    backend masks every LXLU load whose stick holds it -- the kernel and the
+    output read back for accumulation -- so the padding lanes are 0 rather
+    than allocator garbage. The activation is read as it is.
+
+    A padded reduction dim K is not masked here: K is zero-padded by explicit
+    copies ahead of the matmul. The backend masks one dim at a time, and
+    cannot mask a symbolic dim (the iteration space holds its maximum, so a
+    mask computed from it would not match the runtime extent), so those are
+    left unmasked.
+    """
+    if len(inputs) < 2:
+        return {}
+    activation, kernel = inputs[0], inputs[1]
+    symbolic = set(symbolic_dim_names)
+    mask = {
+        dim: [[iteration_space[dim] - padding, padding]]
+        for dim, padding in dim_padding.items()
+        if padding > 0
+        and arg.scales.get(dim) == 1
+        and kernel.scales.get(dim) == 1
+        and dim not in activation.scales
+        and str(dim) not in symbolic
+    }
+    return mask if len(mask) == 1 else {}
+
+
 def _get_coordinate_mask(
     iteration_space: dict,
     arg: SDSCArgs,
     dim_padding: dict,
     op: str = "",
     inputs: list[SDSCArgs] | None = None,
+    symbolic_dim_names: Iterable[str] = (),
 ) -> dict:
+    # Matmul path: mask the kernel's pure-padding columns (N) with 0, see
+    # _get_matmul_coordinate_mask.
+    if op == BATCH_MATMUL_OP:
+        return _get_matmul_coordinate_mask(
+            iteration_space, arg, dim_padding, inputs or [], symbolic_dim_names
+        )
     # Reduction path: mask the stick dim being reduced (scale == -2), so the
     # padding lanes take the reduction identity.
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
@@ -2691,7 +2736,12 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(
-        sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
+        sdsc_iteration_space,
+        args[-1],
+        padding,
+        op_spec.op,
+        args[:-1],
+        symbolic_dim_names=symbolic_dims,
     )
     masking_const_id = -1
     if coordinate_masking:
