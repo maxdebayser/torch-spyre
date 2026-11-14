@@ -1452,3 +1452,58 @@ class TestMatmulReuseDims(InductorTestCase):
             "expected x's SDSCArgs to include a reuse dim (scale == -1) for "
             "the broadcast batch dim E",
         )
+
+
+class TestFp8QuantizeCoordinateMask(InductorTestCase):
+    """qfp8ch/qfp8wt mask the padding of their FP16 input's stick dim with 0.
+
+    The FP8 output rounds the dim up to a 128-element stick; the mask is the
+    FP16 input's own padding, from the logical extent to the end of the
+    input's last 64-element stick. Below, the iteration space holds 256.
+    """
+
+    rows, cols = sympy.symbols("mb out")
+
+    def _mask(self, op, padding):
+        # The FP16 input's stick holds cols, 64 elements to a stick.
+        rows, cols = self.rows, self.cols
+        return superdsc._get_coordinate_mask(
+            {rows: 64, cols: 256},
+            SimpleNamespace(scales={rows: 1, cols: 1}),
+            padding,
+            op,
+            [SimpleNamespace(scales={rows: 1, cols: 1})],
+            input_stick=([cols], [64]),
+        )
+
+    def test_padding_within_the_last_fp8_stick_ends_the_dim(self):
+        # extent % 128 > 64: the input's padding ends the iteration space.
+        for op in ("qfp8ch", "qfp8wt"):
+            for pad in (1, 28, 63):
+                with self.subTest(op=op, pad=pad):
+                    mask = self._mask(op, {self.cols: pad})
+                    self.assertEqual(mask, {self.cols: [[256 - pad, pad]]})
+
+    def test_padding_past_the_input_masks_only_the_input_padding(self):
+        # extent % 128 < 64: the conversion iterates over a stick past the
+        # input's last, so the mask stops short of the end of the dim.
+        for op in ("qfp8ch", "qfp8wt"):
+            for pad, extent in ((106, 150), (84, 172), (127, 129)):
+                with self.subTest(op=op, pad=pad):
+                    input_padding = -extent % 64
+                    mask = self._mask(op, {self.cols: pad})
+                    self.assertEqual(mask, {self.cols: [[extent, input_padding]]})
+
+    def test_extent_filling_its_input_stick_is_not_masked(self):
+        # extent % 64 == 0: the input has no padding, only the stick past it.
+        for op in ("qfp8ch", "qfp8wt"):
+            with self.subTest(op=op):
+                self.assertEqual(self._mask(op, {self.cols: 64}), {})
+
+    def test_only_the_input_stick_dim_is_masked(self):
+        # The QFP8WT row dim K is padded too, but it is not in the FP16
+        # input's stick, so the SAMV cannot mask it.
+        rows, cols = self.rows, self.cols
+        mask = self._mask("qfp8wt", {rows: 32, cols: 28})
+        self.assertEqual(mask, {cols: [[228, 28]]})
+        self.assertEqual(self._mask("qfp8wt", {rows: 32}), {})

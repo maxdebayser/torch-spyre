@@ -44,6 +44,7 @@ from torch.testing._internal.common_utils import (
 from torch_spyre._C import get_elem_in_stick
 from torch_spyre._inductor import config as ts_inductor_config
 from torch_spyre._inductor import passes
+from torch_spyre._inductor.codegen import superdsc
 from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.ir import FixedTiledLayout, SpyreConstantFallback
@@ -1474,6 +1475,200 @@ class TestMatmulPaddingNaN(unittest.TestCase):
         result = compiled(a_spyre, b_spyre)
         expected = fn(a_cpu, b_cpu)
         self._assert_matches_cpu_and_has_no_nan(result, expected)
+
+
+# (activation shape, weight shape) for batchmatmulfp8 with N % 128 > 64, where
+# the weight's padding ends its last FP8 stick (see
+# _get_fp8_quantize_coordinate_mask). Not here: 64x256x200 with LX planning on
+# 1 core returns wrong values with or without the mask, and 128 < N <= 192
+# returns wrong values on more than one core without any padding involved.
+# TODO: cite issues for both.
+FP8_NAN_PAD_CASES = {
+    "2d": ((64, 128), (128, 100)),
+    "2d_n80": ((32, 128), (128, 80)),
+    "3d": ((2, 64, 128), (2, 128, 100)),
+    "3d_shared_weight": ((2, 64, 128), (128, 100)),
+    "4d": ((2, 3, 64, 128), (2, 3, 128, 100)),
+}
+
+FP8_NAN_PAD_CORES = [1, 4, 32]
+
+# No decode (M=1) case: reading back the padding of an M=1 output fails in the
+# copy to the host (out of bounds for its storage), and a chained matmul does
+# not expose it either: quantizing clamps the NaN to +-448, so the padding
+# columns are finite and the next matmul's zero K padding cancels them.
+# TODO: add decode once M=1 padding can be read back.
+
+
+def _stick_padded(n: int) -> int:
+    elems = get_elem_in_stick(torch.float16)
+    return math.ceil(n / elems) * elems
+
+
+def _fp8_exact_nan_padded(shape: tuple[int, ...]) -> tuple[torch.Tensor, torch.Tensor]:
+    """An FP16 spyre tensor of ``shape`` holding FP8-exact values, NaN padded.
+
+    The values are representable in FP8, so quantizing them with a scale of 1
+    is exact and the CPU reference needs no quantization model.
+    """
+    *lead, last = shape
+    full = torch.randn(*lead, _stick_padded(last)).to(torch.float8_e4m3fn)
+    full = full.to(torch.float16)
+    full[..., last:] = float("nan")
+    device = try_reinterpret_host_shape(full.to("spyre"), list(shape))
+    return device, full[..., :last].clone()
+
+
+def _fp8_matmul(a, b, scale):
+    """batchmatmulfp8 of ``a`` and ``b`` quantized the way production does."""
+    q_a = torch.ops.spyre.quantize_fp8_with_scale(a, scale)
+    q_b = torch.ops.spyre.quantize_weight_fp8_with_scale(b, scale)
+    if a.dim() == 2:
+        return torch.ops.aten._scaled_mm(
+            q_a, q_b, scale_a=scale, scale_b=scale, out_dtype=torch.float16
+        )
+    return torch.ops.spyre.scaled_bmm(
+        q_a, q_b, scale_a=scale, scale_b=scale, out_dtype=torch.float16
+    )
+
+
+@instantiate_parametrized_tests
+class TestFp8QuantizeCoordinateMaskingNaN(unittest.TestCase):
+    """The FP8 conversions mask their padding, so NaN there stays out.
+
+    batchmatmulfp8 reads its operands only in the QFP8CH (activation) and
+    QFP8WT (weight) arrangements, which only qfp8ch and qfp8wt produce, so the
+    padding is seeded with 0 there rather than in the matmul. Without it, a NaN
+    past the weight's logical N is clamped to +-448 by the quantization and
+    lands in the matmul output's padding as large finite values. Each test
+    fails without the mask in ``_get_fp8_quantize_coordinate_mask``.
+    """
+
+    def setUp(self) -> None:
+        # Every parametrization compiles the same code object, and Dynamo's
+        # guards do not cover the Spyre config: without a reset, a run with
+        # other sencores/lx_planning would reuse the first run's kernels.
+        torch._dynamo.reset()
+
+    def _assert_close_to_cpu(self, result: torch.Tensor, expected: torch.Tensor):
+        result_cpu = result.cpu()
+        self.assertFalse(
+            result_cpu.isnan().any().item(), "compiled Spyre output contains NaN"
+        )
+        # FP8-exact inputs, fp16 accumulation on the device against an fp32
+        # reference: the error stays below 0.5% of the output's magnitude on
+        # these shapes, so 1% bounds it without hiding a wrong column.
+        scale = expected.abs().max().item()
+        torch.testing.assert_close(
+            result_cpu.float(), expected, rtol=1e-2, atol=1e-2 * scale
+        )
+
+    def _assert_padding_is_zero(self, result: torch.Tensor):
+        *lead, n = result.shape
+        full = try_reinterpret_host_shape(result, [*lead, _stick_padded(n)]).cpu()
+        padding = full[..., n:]
+        self.assertTrue(
+            (padding == 0).all().item(),
+            f"output padding is not 0 (masked to 0): {padding.unique()}",
+        )
+
+    @parametrize("cores", FP8_NAN_PAD_CORES)
+    @parametrize("lx_planning", [False, True])
+    @parametrize("case", list(FP8_NAN_PAD_CASES))
+    def test_fp8_matmul_padded_weight_columns(self, case, lx_planning, cores):
+        a_shape, w_shape = FP8_NAN_PAD_CASES[case]
+        torch.manual_seed(0)
+        a_spyre, a_cpu = _fp8_exact_nan_padded(a_shape)
+        w_spyre, w_cpu = _fp8_exact_nan_padded(w_shape)
+        scale = torch.tensor(1.0, dtype=torch.float16)
+
+        placements: list[str] = []
+        real_parse_op_spec = superdsc.parse_op_spec
+
+        def record_weight_placement(*args, **kwargs):
+            spec, mapping = real_parse_op_spec(*args, **kwargs)
+            if spec.opfunc == "qfp8wt":
+                placements.append(next(iter(spec.args[-1].allocation)))
+            return spec, mapping
+
+        with (
+            ts_inductor_config.patch({"sencores": cores, "lx_planning": lx_planning}),
+            # A compile served from the FX graph cache skips codegen, so the
+            # placement would not be recorded.
+            t_inductor_config.patch(force_disable_caches=True),
+            patch.object(
+                superdsc, "parse_op_spec", side_effect=record_weight_placement
+            ),
+        ):
+            result = torch.compile(_fp8_matmul, fullgraph=True, dynamic=False)(
+                a_spyre, w_spyre, scale.to("spyre")
+            )
+
+        self.assertTrue(placements, "no qfp8wt was compiled")
+        if not lx_planning:
+            self.assertNotIn("lx", placements)
+        elif cores == 1:
+            # On one core LX planning places the quantized weight in LX; on
+            # more it keeps it in the HBM pool.
+            self.assertIn("lx", placements)
+        self._assert_close_to_cpu(result, a_cpu.float() @ w_cpu.float())
+        self._assert_padding_is_zero(result)
+
+    # N % 128 < 64: the conversion iterates over a stick past the last the
+    # weight's FP16 input holds, so the mask covers the input's own padding and
+    # stops short of the end of the dim, which needs a backend that honours
+    # the start of a masked run. Not here: LX planning on 1 core returns wrong
+    # values with or without the mask, and batched shapes with N=300 return
+    # wrong values without it. TODO: cite issues for both.
+    @parametrize(
+        "setting",
+        ["hbm_cores_1", "hbm_cores_4", "hbm_cores_32", "lx_cores_4", "lx_cores_32"],
+    )
+    @parametrize("k", [128, 256])
+    def test_fp8_matmul_padding_past_the_input(self, k, setting):
+        memory, _, cores = setting.split("_")
+        torch.manual_seed(0)
+        a_spyre, a_cpu = _fp8_exact_nan_padded((32, k))
+        w_spyre, w_cpu = _fp8_exact_nan_padded((k, 300))
+        scale = torch.tensor(1.0, dtype=torch.float16)
+        with ts_inductor_config.patch(
+            {"sencores": int(cores), "lx_planning": memory == "lx"}
+        ):
+            result = torch.compile(_fp8_matmul, fullgraph=True, dynamic=False)(
+                a_spyre, w_spyre, scale.to("spyre")
+            )
+        self._assert_close_to_cpu(result, a_cpu.float() @ w_cpu.float())
+        self._assert_padding_is_zero(result)
+
+    # 150 and 300 (width % 128 < 64) mask short of the end of the dim, as in
+    # test_fp8_matmul_padding_past_the_input.
+    @parametrize("cores", FP8_NAN_PAD_CORES)
+    @parametrize("width", [100, 200, 150, 300])
+    def test_qfp8ch_padded_activation(self, width, cores):
+        """The activation's padding past K is 0 once converted back to FP16.
+
+        A QFP8CH tensor cannot be read back to the host in logical order, so
+        the conversion back to FP16 runs in the graph, and the padding is read
+        from the FP16 result.
+        """
+        torch.manual_seed(0)
+        x_spyre, x_cpu = _fp8_exact_nan_padded((64, width))
+        scale = torch.tensor(1.0, dtype=torch.float16)
+
+        def fn(x, scale):
+            return torch.ops.spyre.quantize_fp8_with_scale(x, scale).to(torch.float16)
+
+        with ts_inductor_config.patch({"sencores": cores}):
+            result = torch.compile(fn, fullgraph=True, dynamic=False)(
+                x_spyre, scale.to("spyre")
+            )
+        result_cpu = result.cpu()
+        self.assertFalse(result_cpu.isnan().any().item())
+        # The FP8 -> FP16 conversion on the device differs from the CPU one by
+        # up to 2**-7 on a few elements, aligned widths included (128x128: 116
+        # of 16384), so that is the bound; it is unrelated to the padding.
+        torch.testing.assert_close(result_cpu, x_cpu, rtol=0, atol=2**-7)
+        self._assert_padding_is_zero(result)
 
 
 if __name__ == "__main__":

@@ -327,13 +327,65 @@ def _get_mask_value(
     return _PADDING_MASK_VALUES.get(op, {}).get(data_format, 0.0)
 
 
+# The FP8 format conversions that produce the only arrangements batchmatmulfp8
+# reads correctly: QFP8CH for the activation, QFP8WT for the weight. Any other
+# arrangement compiles and runs but returns wrong values.
+_FP8_QUANTIZE_OPS = frozenset({"qfp8ch", "qfp8wt"})
+
+
+def _get_fp8_quantize_coordinate_mask(
+    iteration_space: dict,
+    dim_padding: dict,
+    input_stick: tuple[list, list] | None,
+) -> dict:
+    """Mask the padding lanes of an FP8 conversion's input with 0.
+
+    batchmatmulfp8 itself is not masked, so the padding of its operands is
+    seeded here, where they are produced: 0 quantizes to 0, so the QFP8CH
+    activation and the QFP8WT weight carry 0 past their logical extent, and the
+    matmul's padding columns come out 0 rather than allocator garbage or NaN.
+
+    The SAMV masks the FP16 input, so only the input's stick dim is masked, and
+    only the input's own padding: the run from the logical extent to the end of
+    the input's last 64-element stick. The FP8 output rounds the dim up to a
+    128-element stick, so for ``extent % 128 <= 64`` the conversion iterates
+    over a stick past the input's last; its lanes reach only output lanes past
+    the matmul output's own last stick, and they are left as they are. The
+    masked run then ends short of the dim's end, which needs a backend that
+    honours the run's start (older ones mask the dim's last stick instead). An
+    extent that fills its last input stick has no padding to mask, and the
+    other padded dims, e.g. the QFP8WT row dim (K), are left unmasked.
+    """
+    if input_stick is None:
+        return {}
+    stick_dims, stick_size = input_stick
+    if len(stick_dims) != 1 or len(stick_size) != 1:
+        return {}
+    (dim,) = stick_dims
+    padding = dim_padding.get(dim, 0)
+    if padding <= 0:
+        return {}
+    extent = iteration_space[dim] - padding
+    input_padding = -extent % stick_size[0]
+    if input_padding == 0:
+        return {}
+    return {dim: [[extent, input_padding]]}
+
+
 def _get_coordinate_mask(
     iteration_space: dict,
     arg: SDSCArgs,
     dim_padding: dict,
     op: str = "",
     inputs: list[SDSCArgs] | None = None,
+    input_stick: tuple[list, list] | None = None,
 ) -> dict:
+    # FP8 conversion path: seed the padding of batchmatmulfp8's operands with 0,
+    # see _get_fp8_quantize_coordinate_mask.
+    if op in _FP8_QUANTIZE_OPS:
+        return _get_fp8_quantize_coordinate_mask(
+            iteration_space, dim_padding, input_stick
+        )
     # Reduction path: mask the stick dim being reduced (scale == -2), so the
     # padding lanes take the reduction identity.
     # Pointwise path: for allowlisted ops (e.g. exp feeding a matmul), also mask
@@ -2691,7 +2743,19 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
     )
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(
-        sdsc_iteration_space, args[-1], padding, op_spec.op, args[:-1]
+        sdsc_iteration_space,
+        args[-1],
+        padding,
+        op_spec.op,
+        args[:-1],
+        input_stick=(
+            (
+                layouts[args[0].layout]["stick_dim_order"],
+                layouts[args[0].layout]["stick_size"],
+            )
+            if len(args) > 1
+            else None
+        ),
     )
     masking_const_id = -1
     if coordinate_masking:
