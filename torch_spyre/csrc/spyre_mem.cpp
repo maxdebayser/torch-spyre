@@ -873,14 +873,6 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
   // dev_tensor is a slice.
   const bool dev_sliced =
       c10::multiply_integers(dma_sizes) > dev_tensor->numel();
-  // The EA shuffle (dimwise_ea) is built over the whole device tensor, not the
-  // slice: such copies fail in the data conversion (leaving the stream in an
-  // error state) or move the wrong elements. Reject them up front.
-  // TODO(maxdebayser): support slices in the EA shuffle, then drop this.
-  TORCH_CHECK(!dev_sliced || !is_ea_staggered(stl.element_arrangement),
-              "Copying a slice of a device tensor with element arrangement ",
-              elementArrangementToString(stl.element_arrangement),
-              " is not supported; copy the whole tensor instead");
   if (dev_sliced) {
     // In these cases we first update the dma_sizes and dma_strides to reflect
     // the cpu_tensor sizes and strides.
@@ -925,6 +917,29 @@ auto generate_dci(const at::Tensor* cpu_tensor, const at::Tensor* dev_tensor,
     }
     cpu_sizes = std::move(adjusted_cpu_sizes);
     cpu_strides = std::move(adjusted_cpu_strides);
+
+    // The EA shuffle (dimwise_ea) is built over the whole device tensor, not
+    // the slice. A D2H copy of a slice that narrows only the stick dim (whole
+    // sticks, e.g. y[:, 64:]) reads the right elements. Any other slice, and
+    // every H2D copy into a slice, fails in the data conversion (leaving the
+    // stream in an error state) or moves the wrong elements, so reject them.
+    // TODO(maxdebayser): support slices in the EA shuffle, then drop this.
+    if (is_ea_staggered(stl.element_arrangement)) {
+      bool only_stick_dim_sliced = true;
+      for (int i = 0; i < dma_rank; i++) {
+        if (dma_strides[i] != 1 && adjusted_dev_sizes[i] != dma_sizes[i]) {
+          only_stick_dim_sliced = false;
+        }
+      }
+      TORCH_CHECK(
+          !host2device && only_stick_dim_sliced,
+          host2device ? "Copying into" : "Copying from",
+          " a slice of a device tensor with element arrangement ",
+          elementArrangementToString(stl.element_arrangement),
+          " is not supported",
+          host2device ? "" : " unless only the stick dimension is sliced",
+          "; copy the whole tensor instead");
+    }
 
     // Reorder cpu_sizes, cpu_strides, dev_sizes, and dev_strides to the same
     // ordering as dma_sizes and dma_strides.

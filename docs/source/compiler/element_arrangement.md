@@ -417,10 +417,11 @@ identity entry.
   shuffle treats sticks 1 and 2 as a pair instead of sticks (0, 1) and (2, 3)
   and produces wrong data without an error. See issue [#5556][issue-5556].
 * **Slices of the device tensor:** the `dimwise_ea` entries describe the whole
-  device tensor, not the slice, so a copy of a device slice (for example
-  `y[1:3]`, `y[:, :64]` or `y[1]`) can fail in the data conversion or move the
-  wrong elements. `generate_dci` rejects such copies, in both directions, for
-  every staggered arrangement: `Copying a slice of a device tensor with element
-  arrangement ... is not supported`. Copy the whole tensor instead.
+  device tensor, not the slice. A D2H copy of a slice that narrows only the
+  stick dim (for example `y[:, 64:]`) is supported. Any other slice (for example
+  `y[1:3]` or `y[1]`), and every H2D copy into a slice, can fail in the data
+  conversion or move the wrong elements, so `generate_dci` rejects it for every
+  staggered arrangement: `Copying into/from a slice of a device tensor with
+  element arrangement ... is not supported`. Copy the whole tensor instead.
 
 [issue-5556]: https://github.com/torch-spyre/torch-spyre/issues/5556

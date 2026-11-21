@@ -176,23 +176,53 @@ class TestQuantizeFP8:
         out.copy_(new)
         torch.testing.assert_close(out.cpu().float(), new.float(), atol=0.0, rtol=0.0)
 
-    @expects_raise
-    @pytest.mark.parametrize("host2device", [True, False], ids=["h2d", "d2h"])
     @pytest.mark.parametrize(
         "shape,index",
         [
-            ((4, 128), (slice(1, 3),)),
             ((4, 128), (slice(None), slice(0, 64))),
             ((4, 256), (slice(None), slice(128, 256))),
-            ((2, 3, 128), (1,)),
+            ((2, 3, 128), (slice(None), slice(None), slice(64, 128))),
         ],
-        ids=["rows", "part_of_stick", "whole_sticks", "int_index"],
+        ids=["part_of_stick", "whole_sticks", "3d_part_of_stick"],
     )
-    def test_activation_quantize_slice_copy_raises(self, shape, index, host2device):
-        """Copies of a slice of an activation FP8 (QFP8CH) tensor are rejected.
+    def test_activation_quantize_stick_dim_slice_cpu_copy(self, shape, index):
+        """.cpu() of a slice of the stick dim of a QFP8CH tensor."""
+        x = _make_arange_fp16(shape)
+        scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
+        out = _compile(_quantize_fn)(x, scale)
+        expected = x.cpu().to(FP32).to(E4M3)[index]
+        torch.testing.assert_close(
+            out[index].cpu().float(), expected.float(), atol=0.0, rtol=0.0
+        )
+
+    @expects_raise
+    @pytest.mark.parametrize(
+        "host2device,shape,index",
+        [
+            (True, (4, 128), (slice(1, 3),)),
+            (True, (4, 128), (slice(None), slice(0, 64))),
+            (True, (4, 256), (slice(None), slice(128, 256))),
+            (True, (2, 3, 128), (1,)),
+            (False, (4, 128), (slice(1, 3),)),
+            (False, (2, 3, 128), (1,)),
+            (False, (2, 3, 128), (slice(1, 2),)),
+        ],
+        ids=[
+            "h2d_rows",
+            "h2d_part_of_stick",
+            "h2d_whole_sticks",
+            "h2d_int_index",
+            "d2h_rows",
+            "d2h_int_index",
+            "d2h_3d_rows",
+        ],
+    )
+    def test_activation_quantize_slice_copy_raises(self, host2device, shape, index):
+        """Copies of unsupported slices of a QFP8CH tensor are rejected.
 
         The copy reorders elements with the DCI's dimwise_ea, which describes
-        the whole device tensor rather than the slice.
+        the whole device tensor rather than the slice. Only D2H copies of slices
+        of the stick dim are supported.
 
         TODO: once the EA shuffle supports slices, make this a positive test.
         """
@@ -200,7 +230,7 @@ class TestQuantizeFP8:
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
         out = _compile(_quantize_fn)(x, scale)
         view = out[index]
-        with pytest.raises(RuntimeError, match="Copying a slice of a device tensor"):
+        with pytest.raises(RuntimeError, match="a slice of a device tensor"):
             if host2device:
                 view.copy_(torch.zeros(view.shape, dtype=E4M3))
             else:
