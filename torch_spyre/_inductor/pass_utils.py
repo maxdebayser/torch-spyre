@@ -4238,7 +4238,7 @@ def lower_pad_sequence(
     dim: int,
     insert_before: torch.fx.Node,
     orig_stl: SpyreTensorLayout | None = None,
-    fill_value: float = 0.0,
+    fill_value: float | None = 0.0,
     arg_buf: Optional[Buffer | ReinterpretView] = None,
 ) -> tuple[Buffer, list[Operation]]:
     """Lower an IR-level pad sequence that extends a buffer along one dimension.
@@ -4246,6 +4246,10 @@ def lower_pad_sequence(
     Allocates a padded buffer of ``padded_size``, fills the pad region with
     ``fill_value``, then copies the original data into offset 0 along ``dim``.
     Only one dimension may differ between ``padded_size`` and the original shape.
+
+    ``fill_value=None`` leaves the pad region unwritten: the sequence is then
+    only ops 1 and 4 below (allocation and copy).  Use it when the caller only
+    needs the buffer to be large enough and the pad values are never used.
 
     Uses torch.ops.aten.constant_pad_nd which lowers to a 4-op IR sequence:
       1. ComputedBuffer - output buffer allocation (FixedLayout)
@@ -4337,7 +4341,7 @@ def lower_pad_sequence(
     #
     # This must happen BEFORE lower_constant_pad_nd runs, not after: that
     # lowering internally slices its freshly-allocated output buffer via
-    # ir.SliceView.create (once per fill_padding region, plus once for the
+    # ir.SliceView.create (once per fill region, plus once for the
     # final input copy).  SliceView.create's fast path snapshots the
     # buffer's *current* layout.stride into a brand-new, independent
     # FixedLayout on the ReinterpretView it returns, with no back-reference
@@ -4487,8 +4491,12 @@ def lower_pad_sequence(
             pad_fx = fx_graph.create_node(
                 "call_function",
                 torch.ops.aten.constant_pad_nd.default,
-                args=(arg_fx_node, pad_tuple, fill_value),
-                kwargs={"align_to_stick": True, "output_stride": padded_stride},
+                args=(arg_fx_node, pad_tuple, fill_value or 0.0),
+                kwargs={
+                    "align_to_stick": True,
+                    "output_stride": padded_stride,
+                    "fill_padding": fill_value is not None,
+                },
             )
             pad_fx.meta["val"] = torch.empty(padded_size, dtype=dtype, device=device)
 
@@ -4523,9 +4531,10 @@ def lower_pad_sequence(
             pad_tb = lower_constant_pad_nd(
                 arg_tb,
                 pad_tuple,
-                fill_value,
+                fill_value or 0.0,
                 align_to_stick=True,
                 output_stride=padded_stride,
+                fill_padding=fill_value is not None,
             )
         graph_lowering.env[pad_fx] = pad_tb
     padded_buf = pad_tb.data.data  # TensorBox -> StorageBox -> Buffer
@@ -4544,16 +4553,23 @@ def lower_pad_sequence(
     #   op1: SpyreConstantFallback - fill constant (FixedLayout)
     #   op2: ComputedBuffer - fill padding region (MutationLayoutSHOULDREMOVE)
     #   op3: ComputedBuffer - copy input data (MutationLayoutSHOULDREMOVE)
+    # or, with fill_value=None, to op0 and op3 only.
+    filled = fill_value is not None
     assert (
-        len(new_ops) == 4
+        len(new_ops) == (4 if filled else 2)
         and isinstance(new_ops[0], ComputedBuffer)
         and isinstance(new_ops[0].get_layout(), FixedLayout)
-        and isinstance(new_ops[1], SpyreConstantFallback)
-        and isinstance(new_ops[1].get_layout(), FixedLayout)
-        and isinstance(new_ops[2], ComputedBuffer)
-        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
-        and isinstance(new_ops[3], ComputedBuffer)
-        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
+        and isinstance(new_ops[-1], ComputedBuffer)
+        and isinstance(new_ops[-1].get_layout(), MutationLayoutSHOULDREMOVE)
+        and (
+            not filled
+            or (
+                isinstance(new_ops[1], SpyreConstantFallback)
+                and isinstance(new_ops[1].get_layout(), FixedLayout)
+                and isinstance(new_ops[2], ComputedBuffer)
+                and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
+            )
+        )
     )
 
     if orig_stl is None:
@@ -4584,25 +4600,22 @@ def lower_pad_sequence(
     # propagate_spyre_tensor_layouts already ran before this pass, so any op
     # lowered here keeps FlexibleLayout unless we assign a FixedTiledLayout
     # immediately. The constant buffer (new_ops[1]) is a scalar tensor (size=[]).
-    const_buf = new_ops[1]
-    const_layout = const_buf.get_layout()
-    const_stl = SpyreTensorLayout(const_layout.size, const_layout.dtype)
-    const_buf.layout = FixedTiledLayout(
-        const_layout.device,
-        const_layout.dtype,
-        const_layout.size,
-        const_layout.stride,
-        const_stl,
-    )
+    if filled:
+        const_buf = new_ops[1]
+        const_layout = const_buf.get_layout()
+        const_stl = SpyreTensorLayout(const_layout.size, const_layout.dtype)
+        const_buf.layout = FixedTiledLayout(
+            const_layout.device,
+            const_layout.dtype,
+            const_layout.size,
+            const_layout.stride,
+            const_stl,
+        )
 
     # Mutation ops are intentionally left untouched
 
-    assert (
-        len(new_ops) == 4
-        and isinstance(new_ops[0].get_layout(), FixedTiledLayout)
-        and isinstance(new_ops[1].get_layout(), FixedTiledLayout)
-        and isinstance(new_ops[2].get_layout(), MutationLayoutSHOULDREMOVE)
-        and isinstance(new_ops[3].get_layout(), MutationLayoutSHOULDREMOVE)
+    assert isinstance(new_ops[0].get_layout(), FixedTiledLayout) and (
+        not filled or isinstance(new_ops[1].get_layout(), FixedTiledLayout)
     )
 
     return padded_buf, list(new_ops)

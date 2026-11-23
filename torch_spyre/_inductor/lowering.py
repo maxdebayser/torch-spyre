@@ -2158,8 +2158,13 @@ def lower_cat(inputs, dim=0):
     torch.ops.aten.constant_pad_nd.default, type_promotion_kind=None
 )
 def lower_constant_pad_nd(
-    input, pad, value=0, align_to_stick=False, output_stride=None
+    input, pad, value=0, align_to_stick=False, output_stride=None, fill_padding=True
 ):
+    # fill_padding=False allocates the padded output and copies the input in,
+    # but leaves the padding region unwritten. Use it when the caller only
+    # needs the buffer to be large enough and the pad values are never read
+    # (e.g. an FP8 matmul weight's extra K rows, which the backend cannot fill
+    # because it cannot splat an FP8 constant).
     # output_stride, when given, is the host stride the *output* buffer must
     # be allocated with (e.g. to match a non-row-major source buffer's
     # physical layout -- see pass_utils.py's lower_pad_sequence).  It must be
@@ -2168,7 +2173,7 @@ def lower_constant_pad_nd(
     # a freshly-allocated ComputedBuffer is_storage_and_layout) snapshots
     # old_layout.stride into a brand-new, independent FixedLayout on the
     # ReinterpretView it returns, with no back-reference to output.layout --
-    # every fill_padding/copy slice built below would keep using the stale
+    # every fill/copy slice built below would keep using the stale
     # stride regardless of any later reassignment of output.layout.
     # pad is in reverse dim order: (left_last, right_last, left_2nd_last, right_2nd_last, ...)
     bounds = list(reversed(list(zip(pad[::2], pad[1::2]))))
@@ -2215,18 +2220,22 @@ def lower_constant_pad_nd(
         )
     else:
         output = lowering.empty(output_size, dtype=dtype, device=device)
-    pad_constant = lower_constant(value, dtype, device)
 
     # Fill padding regions. If align_to_stick is enabled, use stick-aligned offsets.
     # Extra padding from alignment will be overwritten by input.
     stick_size = get_elem_in_stick(dtype)
-    for (left, right), dim in zip(bounds, range(n, len(output_size))):
+    fill_bounds = list(zip(bounds, range(n, len(output_size))))
+    if fill_padding:
+        pad_constant = lower_constant(value, dtype, device)
+    else:
+        fill_bounds = []
+    for (left, right), dim in fill_bounds:
         pad_left = max(0, left)
         pad_right = max(0, right)
         if pad_left + pad_right == 0:
             continue
 
-        def fill_padding(count, offset):
+        def _fill_region(count, offset):
             if align_to_stick:
                 count += offset % stick_size
                 offset = (offset // stick_size) * stick_size
@@ -2238,9 +2247,9 @@ def lower_constant_pad_nd(
             lowering.mutate_to(sliced_output, pad_view)
 
         if pad_left > 0:
-            fill_padding(pad_left, 0)
+            _fill_region(pad_left, 0)
         if pad_right > 0:
-            fill_padding(pad_right, output_size[dim] - pad_right)
+            _fill_region(pad_right, output_size[dim] - pad_right)
 
     # Copy cropped input into the output at the correct offsets
     sliced_output = output

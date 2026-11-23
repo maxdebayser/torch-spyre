@@ -557,6 +557,7 @@ def insert_bmm_padding(graph: GraphLowering) -> None:
             dim=y_k_dim,
             insert_before=matmul_fx_node,
             arg_buf=y_src if y_fx_node is None else None,
+            fill_value=None,
         )
 
         # --- Relocate new ops before the matmul ---
