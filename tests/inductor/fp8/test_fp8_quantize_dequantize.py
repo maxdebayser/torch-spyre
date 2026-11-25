@@ -181,12 +181,29 @@ class TestQuantizeFP8:
         [
             ((4, 128), (slice(None), slice(0, 64))),
             ((4, 256), (slice(None), slice(128, 256))),
+            ((4, 256), (slice(None), slice(72, 200))),
             ((2, 3, 128), (slice(None), slice(None), slice(64, 128))),
+            ((4, 128), (slice(1, 3),)),
+            ((4, 128), (1,)),
+            ((2, 3, 128), (slice(None), slice(1, 2))),
         ],
-        ids=["part_of_stick", "whole_sticks", "3d_part_of_stick"],
+        ids=[
+            "part_of_stick",
+            "whole_sticks",
+            "across_sticks",
+            "3d_part_of_stick",
+            "rows",
+            "int_index",
+            "3d_middle_dim",
+        ],
     )
-    def test_activation_quantize_stick_dim_slice_cpu_copy(self, shape, index):
-        """.cpu() of a slice of the stick dim of a QFP8CH tensor."""
+    def test_activation_quantize_slice_cpu_copy(self, shape, index):
+        """.cpu() of a slice of a QFP8CH tensor.
+
+        The copy packs the sticks the slice touches, and the EA shuffle is
+        applied to them as if they were the whole tensor. That gives the right
+        elements here, because the QFP8CH interleave stays inside one stick.
+        """
         x = _make_arange_fp16(shape)
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
         out = _compile(_quantize_fn)(x, scale)
@@ -203,7 +220,6 @@ class TestQuantizeFP8:
             (True, (4, 128), (slice(None), slice(0, 64))),
             (True, (4, 256), (slice(None), slice(128, 256))),
             (True, (2, 3, 128), (1,)),
-            (False, (4, 128), (slice(1, 3),)),
             (False, (2, 3, 128), (1,)),
             (False, (2, 3, 128), (slice(1, 2),)),
         ],
@@ -212,7 +228,6 @@ class TestQuantizeFP8:
             "h2d_part_of_stick",
             "h2d_whole_sticks",
             "h2d_int_index",
-            "d2h_rows",
             "d2h_int_index",
             "d2h_3d_rows",
         ],
@@ -221,8 +236,11 @@ class TestQuantizeFP8:
         """Copies of unsupported slices of a QFP8CH tensor are rejected.
 
         The copy reorders elements with the DCI's dimwise_ea, which describes
-        the whole device tensor rather than the slice. Only D2H copies of slices
-        of the stick dim are supported.
+        the whole device tensor rather than the slice. Every H2D copy into a
+        slice is rejected. A D2H copy is rejected when the entries built for the
+        slice reach past the coordinate space they describe, which would
+        otherwise fail in the data conversion and leave the stream in an error
+        state.
 
         TODO: once the EA shuffle supports slices, make this a positive test.
         """
@@ -230,7 +248,7 @@ class TestQuantizeFP8:
         scale = torch.tensor(1.0, dtype=FP16, device=DEVICE)
         out = _compile(_quantize_fn)(x, scale)
         view = out[index]
-        with pytest.raises(RuntimeError, match="a slice of a device tensor"):
+        with pytest.raises(RuntimeError, match="slice of a device tensor"):
             if host2device:
                 view.copy_(torch.zeros(view.shape, dtype=E4M3))
             else:
