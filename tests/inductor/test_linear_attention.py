@@ -18,9 +18,10 @@ Four levels, in the order a failure is worth reading:
 
   1. ALGORITHM -- on CPU, no device. ``spyre_linear_attention`` (the real
      decomposition, which only needs plain torch ops, ``for_each_tile`` and the
-     CPU-built mask) against a token-by-token fp32 recurrence that shares no
-     structure with it, and the recurrence against the O(L^2) masked form so the
-     yardstick itself is checked. fp32 on both sides, so tolerances are tight.
+     mask's ``spyre::arange`` ramp, given a CPU kernel below) against a
+     token-by-token fp32 recurrence that shares no structure with it, and the
+     recurrence against the O(L^2) masked form so the yardstick itself is
+     checked. fp32 on both sides, so tolerances are tight.
      It also covers the feature map against ``F.elu`` and that the chunk loop
      traces to ONE ``scan`` whatever the sequence length.
 
@@ -62,6 +63,18 @@ from torch_spyre._inductor.linear_attention import (
 )
 from torch_spyre._inductor.sliding_window_plan import STICK
 from utils_inductor import DEVICE, cached_randn, compare_with_cpu
+
+
+@torch.library.register_kernel("spyre::arange", "cpu")
+def _cpu_arange(length, dtype, device, column=False, owned=False):
+    """The causal mask's ramp for the level-1 checks, which run on CPU.
+
+    ``spyre::arange`` is a Spyre-only op; this host kernel exists only for
+    these tests, which run the decomposition on CPU tensors.
+    """
+    ramp = torch.arange(length, dtype=dtype)
+    return ramp.unsqueeze(-1).clone() if column else ramp
+
 
 # fp32 CPU tolerance. Across the shape grid below (L up to 300, Dk/Dv up to 128,
 # chunk 64-256) the worst error of the chunked form against the recurrence is
@@ -328,19 +341,6 @@ def test_chunk_size_does_not_change_the_result():
     _assert_fp32_close(small_state, large_state, "state")
 
 
-@pytest.mark.parametrize(
-    "height,width,diagonal",
-    [(64, 64, 0), (64, 64, -1), (64, 64, 3), (4, 7, 0), (7, 4, 1)],
-    ids=lambda v: str(v),
-)
-def test_tril_mask_matches_torch_tril(height, width, diagonal):
-    mask = torch.ops.spyre.tril_mask(
-        height, width, diagonal, torch.float16, torch.device("cpu")
-    )
-    expected = torch.tril(torch.ones(height, width), diagonal).to(torch.float16)
-    assert torch.equal(mask, expected)
-
-
 def _trace_chunk_loop(num_chunks, chunk_size=64):
     """Trace the chunk recurrence the way an AOT decomposition reaches it."""
     query, key, value = _inputs(
@@ -406,9 +406,10 @@ def _graph_targets(gm):
 
 @pytest.mark.parametrize("is_causal", [True, False], ids=["causal", "noncausal"])
 def test_single_token_call_has_no_mask_or_loop(is_causal):
-    """Decode (``L == 1``) is one state update and one matmul: no ``tril_mask``
-    and no chunk loop in the traced graph. The token axis is still padded to a
-    stick for the update, because a contraction-1 matmul does not lower."""
+    """Decode (``L == 1``) is one state update and one matmul: no mask (so no
+    ``spyre.arange`` coordinate) and no chunk loop in the traced graph. The
+    token dim is still padded to a stick for the update, because a
+    contraction-1 matmul does not lower."""
     query, key, value = _inputs(1, 2, 1, 64, 64, dtype=torch.float32)
     state = _state(1, 2, dtype=torch.float32)
 
@@ -418,7 +419,7 @@ def test_single_token_call_has_no_mask_or_loop(is_causal):
     gm = make_fx(decode, tracing_mode="fake")(query, key, value, state)
 
     targets = _graph_targets(gm)
-    assert torch.ops.spyre.tril_mask.default not in targets
+    assert torch.ops.spyre.arange.default not in targets
     assert _scan_nodes(gm) == []
 
 
@@ -432,7 +433,7 @@ def test_multi_token_call_still_builds_the_mask():
         tracing_mode="fake",
     )(query, key, value)
 
-    assert torch.ops.spyre.tril_mask.default in _graph_targets(gm)
+    assert torch.ops.spyre.arange.default in _graph_targets(gm)
 
 
 def test_unsupported_device_dtype_is_refused():
@@ -462,12 +463,88 @@ def _probe_input(probes, shape, differentiation, dtype):
     return flat.view(shape)
 
 
+def _cpu_model():
+    try:
+        with open("/proc/cpuinfo") as cpuinfo:
+            for line in cpuinfo:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _feature_map_diagnostics(x, actual, expected, worst=5):
+    """What a reader needs to tell a tolerance problem from a bad ``exp``.
+
+    Both formulas are fp32 CPU computations that agree to about 6e-8 (one ulp), so
+    a failure of ``atol = rtol = 1e-6`` is not rounding noise. One CI failure
+    (merge queue, one pod; the pod-level retry on another pod passed) showed
+    1.05e-4 / 1.5e-4 on 670 of 4096 elements and could not be reproduced afterwards.
+    This reports the environment, which side is far from an fp64 reference, the
+    elements that are worst, and whether recomputing gives the same bits, so the
+    next occurrence says where to look.
+    """
+    reference = F.elu(x.double()) + 1.0
+    far = (actual.double() - reference).abs()
+    far_expected = (expected.double() - reference).abs()
+    difference = (actual - expected).abs().flatten()
+    order = difference.argsort(descending=True)[:worst]
+    rows = [
+        f"  x={x.flatten()[i].item()!r} actual={actual.flatten()[i].item()!r} "
+        f"expected={expected.flatten()[i].item()!r} "
+        f"fp64={reference.flatten()[i].item()!r}"
+        for i in order.tolist()
+    ]
+    negative = torch.minimum(x, torch.zeros_like(x))
+    exp_error = (torch.exp(negative).double() - torch.exp(negative.double())).abs()
+    again = feature_map(x)
+    return "\n".join(
+        [
+            "feature-map diagnostics:",
+            f"  torch {torch.__version__}, cpu capability "
+            f"{torch.backends.cpu.get_cpu_capability()}, "
+            f"{torch.get_num_threads()} threads, cpu {_cpu_model()}",
+            f"  max |feature_map - fp64 reference| = {far.max().item()!r}, "
+            f"max |elu + 1 - fp64 reference| = {far_expected.max().item()!r}",
+            f"  max |torch.exp(min(x, 0)) - fp64 exp| = {exp_error.max().item()!r}",
+            f"  recomputing feature_map(x) gives the same bits: "
+            f"{bool(torch.equal(again, actual))}",
+            "  worst elements by |actual - expected|:",
+            *rows,
+        ]
+    )
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=str)
 def test_feature_map_matches_elu_plus_one(dtype):
     """The Spyre-safe formula is ``elu(x) + 1``: negative, near-zero, positive."""
     x = _probe_input(FEATURE_MAP_WIDE_PROBES, (64, 64), 32, dtype)
+    actual, expected = feature_map(x), F.elu(x) + 1.0
 
-    torch.testing.assert_close(feature_map(x), F.elu(x) + 1.0, atol=1e-6, rtol=1e-6)
+    try:
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    except AssertionError as error:
+        # The same failure, with what is needed to attribute it.
+        raise AssertionError(
+            f"{error}\n{_feature_map_diagnostics(x, actual, expected)}"
+        ) from error
+
+
+def test_the_feature_map_failure_report_names_the_worst_elements():
+    """The report names the worst elements and the environment. Fed a result that is
+    wrong in one place, the wrong place comes first."""
+    x = _probe_input(FEATURE_MAP_WIDE_PROBES, (64, 64), 32, torch.float32)
+    expected = F.elu(x) + 1.0
+    actual = feature_map(x).clone()
+    actual.view(-1)[37 * 64 + 39] += 1e-3
+
+    report = _feature_map_diagnostics(x, actual, expected)
+
+    assert "cpu capability" in report and "worst elements" in report
+    first = report.split("worst elements by |actual - expected|:\n")[1].splitlines()[0]
+    assert f"x={x[37, 39].item()!r}" in first
+    assert "recomputing feature_map(x) gives the same bits: False" in report
 
 
 def test_feature_map_does_not_overflow_in_fp16():
